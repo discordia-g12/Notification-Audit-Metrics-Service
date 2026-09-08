@@ -1,0 +1,43 @@
+services:
+  notification-postgres:
+    image: postgres:16-alpine
+    container_name: notification-postgres
+    restart: unless-stopped
+    ports:
+      - "5432"
+    environment:
+      POSTGRES_DB: notification_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    volumes:
+      - notification-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notification_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notification-service
+    restart: unless-stopped
+    ports:
+      - "3000"
+    environment:
+      - PORT=3000
+      - DATABASE_URL=postgresql://postgres:password@notification-postgres:5432/notification_db
+    depends_on:
+      notification-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/livez > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  notification-pgdata:
