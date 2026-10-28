@@ -15,7 +15,7 @@ services:
     image: postgres:16-alpine
     container_name: discordia_notification_db
     ports:
-      - "5432"
+      - "5434:5432" # desde el host: npm run dev con DATABASE_URL en localhost:5434
     environment:
       POSTGRES_DB: notification_db
       POSTGRES_USER: postgres
