@@ -3,10 +3,10 @@
 Servicio de notificaciones, auditoría y métricas de Discordia (Node.js 20, TypeScript, Fastify 4 y
 PostgreSQL).
 
-**Estado actual: es un esqueleto.** Tiene el servidor, la conexión a PostgreSQL, los health checks, los tests y
-el pipeline de CI/CD, pero todavía no tiene funcionalidad (`src/modules/` está vacío). El Gateway ya le
-enruta `/api/v1/notifications`, `/api/v1/audit` y `/api/v1/metrics` (solo `staff`) y `/api/v1/status`
-(pública): hoy esas rutas responden `404`.
+**Estado actual:** tiene el servidor, la conexión a PostgreSQL, los health checks, el pipeline de CI/CD y el
+**estado de la plataforma** (`/api/v1/status` y `/api/v1/admin/status`, ver [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md)).
+Notificaciones, auditoría y métricas todavía no están: el Gateway ya le enruta `/api/v1/notifications`,
+`/api/v1/audit` y `/api/v1/metrics` (solo `staff`), y hoy esas rutas responden `404`.
 
 ## Requisitos
 
@@ -49,6 +49,12 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 |----------|---------|-------------|
 | `PORT` | `3000` | Puerto HTTP |
 | `DATABASE_URL` | `postgresql://postgres:password@127.0.0.1:5432/notification_db` | PostgreSQL. En producción lleva `?sslmode=no-verify`: el RDS exige TLS y la imagen no trae la CA de Amazon |
+| `STATUS_GATEWAY_URL` | (sin definir) | Base de Kong para las sondas de estado (`https://10.0.1.10:443` en prod, `https://host.docker.internal:8443` en local). Sin definir, los servicios que se sondean vía Kong quedan `unknown` |
+| `STATUS_TLS_INSECURE` | `false` | `true` desactiva la verificación del certificado **solo** en las sondas de estado (el Origin Certificate de Cloudflare y el autofirmado local no los valida Node) |
+| `STATUS_POLL_INTERVAL_MS` | `15000` | Cada cuánto se sondea (1000 a 3600000) |
+| `STATUS_PROBE_TIMEOUT_MS` | `2000` | Timeout de cada sonda (100 a 60000, menor que el intervalo) |
+
+Un valor inválido en las `STATUS_*` corta el arranque.
 
 ## API
 
@@ -56,6 +62,45 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 |---|---|---|
 | `GET` | `/livez` | El proceso está vivo, sin I/O: `{"status":"alive"}` |
 | `GET` | `/readyz` | `SELECT 1` contra PostgreSQL (timeout de 2 s). `200 {"status":"ready"}` o `503 {"status":"not_ready","detail":...}` |
+| `GET` | `/api/v1/status` | Estado de la plataforma, **público** (historia 74, CA3) |
+| `GET` | `/api/v1/admin/status` | Estado con detalle técnico, solo `staff` (`X-User-Role: staff`, si no `403 application/problem+json`) |
+
+### Estado de la plataforma
+
+Un monitor en memoria sondea en paralelo cada `STATUS_POLL_INTERVAL_MS` el `/readyz` de cada servicio a través
+de Kong (`{STATUS_GATEWAY_URL}/readyz` para el propio Kong y `/internal/readyz/{auth|server-roles|chat|voice|payments}`
+para el resto). Este servicio se mide a sí mismo con el mismo chequeo de `/readyz`, sin pasar por Kong. Los
+endpoints devuelven el último resultado guardado: ninguna request dispara sondas. Ambos con
+`cache-control: no-store`.
+
+- Por servicio: `2xx` → `operational`; timeout, error de red o no-2xx → `degraded`; nunca chequeado o sonda no
+  configurada → `unknown`.
+- Global: `degraded` si alguno lo está; si no, `unknown` si alguno lo está; si no, `operational`.
+
+```text
+GET /api/v1/status
+{ status, checkedAt, services: [{ id, name, status }] }
+
+GET /api/v1/admin/status
+{ status, checkedAt, services: [{ id, name, status, httpStatus, latencyMs, checkedAt, since, error }] }
+```
+
+`checkedAt` global es el fin de la última ronda (`null` antes de la primera). `since` es desde cuándo el
+servicio está en el estado actual. `error` es `null` o un código fijo (`timeout`, `connection_refused`,
+`http_5xx`, `http_4xx`, `invalid_response`): nunca el mensaje de la excepción ni el body del upstream.
+
+Probarlo en local (con `npm run dev`, puerto 3000):
+
+```bash
+curl -s localhost:3000/api/v1/status | jq
+curl -si localhost:3000/api/v1/admin/status                          # 403 problem+json
+curl -s -H 'X-User-Role: staff' localhost:3000/api/v1/admin/status | jq
+```
+
+El header `X-User-Role` a mano es **solo para local**, llamando directo al servicio. A través de Kong el header
+del cliente se borra y lo pone el Gateway desde el token: `/api/v1/admin/status` necesita un access token con
+rol `staff` (ADR-002 del Gateway). Sin `STATUS_GATEWAY_URL` todo lo que va por Kong sale `unknown`; para
+sondear el Kong local: `STATUS_GATEWAY_URL=https://localhost:8443 STATUS_TLS_INSECURE=true npm run dev`.
 
 ## Tests, lint y seguridad
 
@@ -80,9 +125,12 @@ DATABASE_URL=postgresql://postgres:password@localhost:5434/notification_db npm r
 ```text
 src/
 ├── server.ts     arranque
-├── app.ts        app de Fastify, pool de PostgreSQL, /livez y /readyz
-├── modules/      (vacío) acá van las notificaciones, la auditoría y las métricas
-├── config/, plugins/, utils/   (vacíos)
+├── app.ts        app de Fastify, pool de PostgreSQL, /livez, /readyz y registro del módulo de estado
+├── config/       status.ts: lectura y validación de las STATUS_*
+├── modules/
+│   └── status/   monitor en memoria, sondas HTTP, catálogo de servicios, vistas y rutas
+├── utils/        db-check.ts: SELECT 1 con timeout (lo usan /readyz y el monitor)
+├── plugins/      (vacío)
 tests/
 ```
 
@@ -101,3 +149,4 @@ tests/
 | ADR | Tema |
 |-----|------|
 | [ADR-01](docs/ADR-01-CI-CD-Pipeline.md) | Pipeline de CI/CD |
+| [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) | Estado de la plataforma por sondeo de `/readyz` vía Kong |
