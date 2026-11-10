@@ -1,0 +1,263 @@
+openapi: 3.1.0
+info:
+  title: Notification-Audit-Metrics-Service — estado de la plataforma e incidentes
+  version: 1.0.0
+  description: |
+    Estado de la plataforma (ADR-02) e incidentes (ADR-03), historia 74. Las rutas `/api/v1/admin/*` pasan por
+    Kong con `validate("staff")`; el servicio vuelve a chequear `X-User-Role` (y `X-User-Id` para escribir), que
+    pone Kong desde el token. Errores en `application/problem+json`.
+servers:
+  - url: https://api.discordia.lol
+    description: Producción, a través de Kong
+  - url: http://localhost:8000
+    description: Kong local
+
+paths:
+  /livez:
+    get:
+      summary: El proceso está vivo
+      responses:
+        '200':
+          description: Vivo
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { const: alive } } }
+  /readyz:
+    get:
+      summary: PostgreSQL responde
+      responses:
+        '200':
+          description: Listo
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { const: ready } } }
+        '503':
+          description: Sin base
+  /api/v1/status:
+    get:
+      summary: Estado público e incidentes activos (CA1, CA3)
+      security: []
+      responses:
+        '200':
+          description: Estado combinado (sondeo más incidentes) e incidentes activos
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicStatus' }
+  /api/v1/admin/status:
+    get:
+      summary: Sondeo crudo con detalle técnico (staff)
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: Estado de cada servicio según su /readyz
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/incidents:
+    post:
+      summary: Publicar un incidente (CA1, staff)
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewIncident' }
+      responses:
+        '201':
+          description: Publicado. Queda en audit_logs (incident.created).
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminIncident' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      summary: Historial de incidentes (staff)
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/IncidentStatus' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - name: before
+          in: query
+          description: Cursor (nextBefore de la página anterior). Solo incidentes creados antes.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Más nuevos primero
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextBefore]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AdminIncident' } }
+                  nextBefore: { type: [string, 'null'], format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/incidents/{id}/resolve:
+    post:
+      summary: Resolver un incidente activo (CA2, staff)
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: [string, 'null'], maxLength: 1000, description: Nota de cierre (historial y auditoría) }
+      responses:
+        '200':
+          description: Resuelto. Queda en audit_logs (incident.resolved).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminIncident' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409':
+          description: Ya estaba resuelto
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  responses:
+    BadRequest:
+      description: Campos inválidos
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Sin token o token inválido (lo responde Kong)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: La cuenta no es staff (Kong o el servicio), o falta X-User-Id para escribir
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Problem:
+      description: No existe
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    ServiceId:
+      type: string
+      enum: [gateway, auth, server-roles, chat, voice, notification, payments]
+    ProbeStatus:
+      type: string
+      enum: [operational, degraded, unknown]
+    PlatformStatus:
+      type: string
+      enum: [operational, degraded, maintenance, unknown]
+    IncidentKind:
+      type: string
+      enum: [degraded, maintenance]
+    IncidentStatus:
+      type: string
+      enum: [active, resolved]
+    NewIncident:
+      type: object
+      additionalProperties: false
+      required: [title, description, kind, affectedServices]
+      properties:
+        title: { type: string, minLength: 3, maxLength: 120, description: Sin contar espacios al inicio y al final }
+        description: { type: string, minLength: 1, maxLength: 1000 }
+        kind: { $ref: '#/components/schemas/IncidentKind' }
+        affectedServices:
+          type: array
+          minItems: 1
+          maxItems: 7
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/ServiceId' }
+    PublicIncident:
+      type: object
+      required: [id, kind, title, description, affectedServices, startedAt]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/IncidentKind' }
+        title: { type: string }
+        description: { type: string }
+        affectedServices: { type: array, items: { $ref: '#/components/schemas/ServiceId' } }
+        startedAt: { type: string, format: date-time }
+    AdminIncident:
+      allOf:
+        - $ref: '#/components/schemas/PublicIncident'
+        - type: object
+          required: [status, createdBy, resolvedBy, resolvedAt, resolutionNote]
+          properties:
+            status: { $ref: '#/components/schemas/IncidentStatus' }
+            createdBy: { type: string }
+            resolvedBy: { type: [string, 'null'] }
+            resolvedAt: { type: [string, 'null'], format: date-time }
+            resolutionNote: { type: [string, 'null'] }
+    PublicStatus:
+      type: object
+      required: [status, checkedAt, services, incidents]
+      properties:
+        status: { $ref: '#/components/schemas/PlatformStatus' }
+        checkedAt: { type: [string, 'null'], format: date-time }
+        services:
+          type: array
+          items:
+            type: object
+            required: [id, name, status]
+            properties:
+              id: { $ref: '#/components/schemas/ServiceId' }
+              name: { type: string }
+              status: { $ref: '#/components/schemas/PlatformStatus' }
+        incidents: { type: array, items: { $ref: '#/components/schemas/PublicIncident' } }
+    AdminStatus:
+      type: object
+      required: [status, checkedAt, services]
+      properties:
+        status: { $ref: '#/components/schemas/ProbeStatus' }
+        checkedAt: { type: [string, 'null'], format: date-time }
+        services:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { $ref: '#/components/schemas/ServiceId' }
+              name: { type: string }
+              status: { $ref: '#/components/schemas/ProbeStatus' }
+              httpStatus: { type: [integer, 'null'] }
+              latencyMs: { type: [integer, 'null'] }
+              checkedAt: { type: [string, 'null'], format: date-time }
+              since: { type: [string, 'null'], format: date-time }
+              error:
+                type: [string, 'null']
+                enum: [timeout, connection_refused, http_5xx, http_4xx, invalid_response, null]
+    Problem:
+      type: object
+      required: [type, title, status, detail, instance]
+      properties:
+        type: { type: string, example: about:blank }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }

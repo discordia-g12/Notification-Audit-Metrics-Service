@@ -1,6 +1,15 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import { Pool } from 'pg';
 import { loadStatusConfig } from './config/status';
+import { MIGRATIONS } from './db/migrations';
+import { runMigrations } from './db/migrate';
+import {
+  ACTIVE_INCIDENTS_TTL_MS,
+  ActiveIncidentsCache,
+  incidentRoutes,
+  PgIncidentStore,
+  type IncidentStore,
+} from './modules/incidents';
 import { createStatusMonitor, statusRoutes, type StatusSource } from './modules/status';
 import {
   initAuditDatabase,
@@ -18,6 +27,10 @@ export interface BuildAppOptions {
   env?: Record<string, string | undefined>;
   /** Reemplaza el monitor de estado real (tests). */
   statusMonitor?: StatusSource;
+  /** Reemplaza el store de incidentes en Postgres (tests). */
+  incidentStore?: IncidentStore;
+  /** Aplica las migraciones pendientes antes de quedar lista (server.ts). Los tests migran por su cuenta. */
+  migrate?: boolean;
   logger?: boolean;
   /** Reemplaza el pool de Postgres (tests). */
   pool?: Pool;
@@ -71,7 +84,23 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       createDatabaseCheck(pool, statusConfig.probeTimeoutMs),
       app.log.child({ module: 'status' }),
     );
-  app.register(statusRoutes, { monitor: statusMonitor });
+  const incidentStore = options.incidentStore ?? new PgIncidentStore(pool);
+  const activeIncidents = new ActiveIncidentsCache({
+    load: () => incidentStore.listActive(),
+    ttlMs: ACTIVE_INCIDENTS_TTL_MS,
+    logger: app.log.child({ module: 'incidents' }),
+  });
+
+  app.register(statusRoutes, { monitor: statusMonitor, incidents: activeIncidents });
+  app.register(incidentRoutes, { store: incidentStore, activeIncidents });
+
+  // Antes que el monitor: si una migración falla, ready() rechaza, el listen no ocurre y el contenedor no
+  // queda healthy (el deploy vuelve a la imagen anterior).
+  if (options.migrate) {
+    app.addHook('onReady', async () => {
+      await runMigrations(pool, MIGRATIONS, app.log.child({ module: 'migrations' }));
+    });
+  }
 
   app.register(auditRoutes, {
     pool,

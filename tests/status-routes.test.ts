@@ -23,7 +23,8 @@ test('GET /api/v1/status: forma pública exacta, sin campos de staff', async () 
   assert.strictEqual(res.headers['cache-control'], 'no-store');
 
   const body = res.json();
-  assert.deepStrictEqual(Object.keys(body).sort(), ['checkedAt', 'services', 'status']);
+  assert.deepStrictEqual(Object.keys(body).sort(), ['checkedAt', 'incidents', 'services', 'status']);
+  assert.deepStrictEqual(body.incidents, []);
   assert.strictEqual(body.status, 'operational');
   assert.strictEqual(body.checkedAt, '2026-11-03T12:00:00.035Z');
   assert.deepStrictEqual(body.services, [

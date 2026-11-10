@@ -1,9 +1,14 @@
+import type { Incident } from '../incidents/types';
+import { toPublicIncident, type PublicIncidentView } from '../incidents/views';
+import { combineStatus, type PlatformStatus } from './combine';
 import type { ProbeError, ServiceStatus, StatusSnapshot } from './types';
 
+/** Vista pública: estado combinado con los incidentes activos (historia 74, CA1 y CA3). */
 export interface PublicStatusView {
-  status: ServiceStatus;
+  status: PlatformStatus;
   checkedAt: string | null;
-  services: Array<{ id: string; name: string; status: ServiceStatus }>;
+  services: Array<{ id: string; name: string; status: PlatformStatus }>;
+  incidents: PublicIncidentView[];
 }
 
 export interface AdminStatusView {
@@ -24,14 +29,17 @@ export interface AdminStatusView {
 const iso = (date: Date | null): string | null => (date ? date.toISOString() : null);
 
 // Se arma campo por campo: lo que no está acá no sale, aunque se agregue al estado interno.
-export function toPublicView(snapshot: StatusSnapshot): PublicStatusView {
+export function toPublicView(snapshot: StatusSnapshot, incidents: readonly Incident[] = []): PublicStatusView {
+  const combined = combineStatus(snapshot, incidents);
   return {
-    status: snapshot.status,
+    status: combined.status,
     checkedAt: iso(snapshot.checkedAt),
-    services: snapshot.services.map(({ id, name, status }) => ({ id, name, status })),
+    services: combined.services.map(({ id, name, status }) => ({ id, name, status })),
+    incidents: incidents.map(toPublicIncident),
   };
 }
 
+/** La vista staff es el sondeo crudo: el backoffice la cruza con los incidentes para sugerir uno. */
 export function toAdminView(snapshot: StatusSnapshot): AdminStatusView {
   return {
     status: snapshot.status,
