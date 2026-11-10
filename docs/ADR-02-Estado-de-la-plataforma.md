@@ -4,7 +4,8 @@
 - **Fecha:** 2026-11-03
 - **Alcance:** este servicio (`/api/v1/status`, `/api/v1/admin/status`), Gateway (rutas `/internal/readyz/*`),
   Discordia-WebApp (página de estado y backoffice)
-- **Relacionado:** ADR-002 del Gateway (rol staff), ADR-O2 de `observability` (niveles de señales)
+- **Relacionado:** ADR-002 del Gateway (rol staff), ADR-O2 de `observability` (niveles de señales),
+  [ADR-03](ADR-03-Incidentes-y-migraciones.md) (incidentes, CA1/CA2)
 
 ## Contexto
 
@@ -54,7 +55,7 @@ valida.
 | Sondear en cada request | Una página pública haría fan-out de siete requests por visita: carga y latencia proporcionales al tráfico, y una forma fácil de amplificar un abuso. |
 | Una URL por servicio, sin Kong | Siete variables más, y conocer IP y puerto de cada nodo desde realtime. Kong ya resuelve ese ruteo y el sondeo prueba también el camino real de las requests. |
 | Agregar la CA de origen de Cloudflare a la imagen | El certificado está emitido para el dominio, no para la IP privada que se sondea (fallaría igual la verificación del nombre), y el local es autofirmado. Verificar TLS no protege nada en una sonda sin secretos dentro de la VPC. |
-| Persistir el historial en Postgres | Es CA1/CA2 (incidentes), que necesita migraciones que todavía no existen. |
+| Persistir el historial en Postgres | Es CA1/CA2 (incidentes), que necesita migraciones. Resuelto en [ADR-03](ADR-03-Incidentes-y-migraciones.md). |
 
 ## Consecuencias
 
@@ -65,6 +66,7 @@ valida.
   ve un usuario (sin Kong no hay plataforma), pero el detalle staff no distingue la causa.
 - Cada réplica de este servicio sondea por su cuenta. Con una sola réplica no importa; si se escala, el tráfico
   de sondeo crece con las réplicas y cada una puede mostrar un estado un poco distinto.
-- Queda pendiente CA1/CA2 (incidentes y su historial), cuando el servicio tenga migraciones.
+- CA1/CA2 (incidentes y su historial) se resolvieron en [ADR-03](ADR-03-Incidentes-y-migraciones.md): la
+  vista pública suma los incidentes activos y combina su estado con el sondeado.
 - El despliegue tiene que pasarle `STATUS_GATEWAY_URL` y `STATUS_TLS_INSECURE` al contenedor
   (`deploy/` del orquestador). Sin ellas el servicio arranca igual, con esos seis servicios en `unknown`.

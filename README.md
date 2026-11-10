@@ -4,7 +4,9 @@ Servicio de notificaciones, auditoría y métricas de Discordia (Node.js 20, Typ
 PostgreSQL).
 
 **Estado actual:** tiene el servidor, la conexión a PostgreSQL, los health checks, el pipeline de CI/CD y el
-**estado de la plataforma** (`/api/v1/status` y `/api/v1/admin/status`, ver [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md)).
+**estado de la plataforma** con sus **incidentes** (`/api/v1/status`, `/api/v1/admin/status` y
+`/api/v1/admin/incidents`, ver [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) y
+[ADR-03](docs/ADR-03-Incidentes-y-migraciones.md)). Las tablas se crean con migraciones al arrancar.
 Notificaciones, auditoría y métricas todavía no están: el Gateway ya le enruta `/api/v1/notifications`,
 `/api/v1/audit` y `/api/v1/metrics` (solo `staff`), y hoy esas rutas responden `404`.
 
@@ -62,8 +64,13 @@ Un valor inválido en las `STATUS_*` corta el arranque.
 |---|---|---|
 | `GET` | `/livez` | El proceso está vivo, sin I/O: `{"status":"alive"}` |
 | `GET` | `/readyz` | `SELECT 1` contra PostgreSQL (timeout de 2 s). `200 {"status":"ready"}` o `503 {"status":"not_ready","detail":...}` |
-| `GET` | `/api/v1/status` | Estado de la plataforma, **público** (historia 74, CA3) |
+| `GET` | `/api/v1/status` | Estado de la plataforma e incidentes activos, **público** (historia 74, CA1 y CA3) |
 | `GET` | `/api/v1/admin/status` | Estado con detalle técnico, solo `staff` (`X-User-Role: staff`, si no `403 application/problem+json`) |
+| `POST` | `/api/v1/admin/incidents` | Publicar un incidente, solo `staff` (CA1) |
+| `GET` | `/api/v1/admin/incidents` | Historial (`?status=active\|resolved&limit=1..100&before=<ISO>`), solo `staff` |
+| `POST` | `/api/v1/admin/incidents/{id}/resolve` | Resolver (`{"note"?}`), solo `staff` (CA2). `404` si no existe, `409` si ya estaba resuelto |
+
+El contrato completo está en [`docs/openapi.yaml`](docs/openapi.yaml).
 
 ### Estado de la plataforma
 
@@ -79,7 +86,8 @@ endpoints devuelven el último resultado guardado: ninguna request dispara sonda
 
 ```text
 GET /api/v1/status
-{ status, checkedAt, services: [{ id, name, status }] }
+{ status, checkedAt, services: [{ id, name, status }],
+  incidents: [{ id, kind, title, description, affectedServices, startedAt }] }
 
 GET /api/v1/admin/status
 { status, checkedAt, services: [{ id, name, status, httpStatus, latencyMs, checkedAt, since, error }] }
@@ -97,9 +105,26 @@ curl -si localhost:3000/api/v1/admin/status                          # 403 probl
 curl -s -H 'X-User-Role: staff' localhost:3000/api/v1/admin/status | jq
 ```
 
+### Incidentes
+
+El staff publica un incidente (`degraded` o `maintenance`) con título (3 a 120), descripción (hasta 1000) y
+servicios afectados (ids del catálogo de arriba). Mientras está activo, sale en `GET /api/v1/status` y cambia el
+estado: por servicio, un mantenimiento gana; si no, `degraded` si lo dice un incidente o la sonda. Global:
+`degraded` > `maintenance` > `unknown` > `operational`. Cada publicación y cierre queda en `audit_logs` en la
+misma transacción. Escribir necesita `X-User-Id` además del rol (el autor de la auditoría).
+
+```bash
+curl -s -X POST localhost:3000/api/v1/admin/incidents \
+  -H 'X-User-Role: staff' -H 'X-User-Id: auth0|local' -H 'content-type: application/json' \
+  -d '{"title":"Demoras en la voz","description":"Los canales tardan en conectar","kind":"degraded","affectedServices":["voice"]}' | jq
+curl -s localhost:3000/api/v1/status | jq '.status, .incidents'
+curl -s -X POST localhost:3000/api/v1/admin/incidents/<id>/resolve \
+  -H 'X-User-Role: staff' -H 'X-User-Id: auth0|local' -H 'content-type: application/json' -d '{"note":"listo"}' | jq
+```
+
 El header `X-User-Role` a mano es **solo para local**, llamando directo al servicio. A través de Kong el header
 del cliente se borra y lo pone el Gateway desde el token: `/api/v1/admin/status` necesita un access token con
-rol `staff` (ADR-002 del Gateway). Sin `STATUS_GATEWAY_URL` todo lo que va por Kong sale `unknown`; para
+rol `staff` (ADR-002 del Gateway). Lo mismo para `/api/v1/admin/incidents`. Sin `STATUS_GATEWAY_URL` todo lo que va por Kong sale `unknown`; para
 sondear el Kong local: `STATUS_GATEWAY_URL=https://localhost:8443 STATUS_TLS_INSECURE=true npm run dev`.
 
 ## Tests, lint y seguridad
@@ -113,7 +138,9 @@ npm audit --audit-level=high   # dependencias con vulnerabilidades (en el CI no 
 npm run test:coverage          # tests + cobertura (mínimo 85 %, ver ADR-01)
 ```
 
-**Un test necesita PostgreSQL** (el de `/readyz` con la base disponible). Con la base del compose:
+**Los tests necesitan PostgreSQL**: el de `/readyz` y los de migraciones, incidentes y auditoría. Cada archivo
+de tests usa un schema propio (`test_<random>`) que borra al terminar, así corren en paralelo sin pisarse. Con la
+base del compose:
 
 ```bash
 docker compose up -d notification_db
@@ -125,11 +152,13 @@ DATABASE_URL=postgresql://postgres:password@localhost:5434/notification_db npm r
 ```text
 src/
 ├── server.ts     arranque
-├── app.ts        app de Fastify, pool de PostgreSQL, /livez, /readyz y registro del módulo de estado
+├── app.ts        app de Fastify, pool de PostgreSQL, /livez, /readyz, migraciones y registro de los módulos
 ├── config/       status.ts: lectura y validación de las STATUS_*
+├── db/           migrate.ts (runner con advisory lock) y migrations.ts (las migraciones, en orden)
 ├── modules/
-│   └── status/   monitor en memoria, sondas HTTP, catálogo de servicios, vistas y rutas
-├── utils/        db-check.ts: SELECT 1 con timeout (lo usan /readyz y el monitor)
+│   ├── status/   monitor en memoria, sondas HTTP, catálogo de servicios, estado combinado, vistas y rutas
+│   └── incidents/ store en Postgres (con auditoría), caché de activos, vistas y rutas de staff
+├── utils/        db-check.ts (SELECT 1 con timeout) y problem.ts (respuestas application/problem+json)
 ├── plugins/      (vacío)
 tests/
 ```
@@ -150,3 +179,4 @@ tests/
 |-----|------|
 | [ADR-01](docs/ADR-01-CI-CD-Pipeline.md) | Pipeline de CI/CD |
 | [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) | Estado de la plataforma por sondeo de `/readyz` vía Kong |
+| [ADR-03](docs/ADR-03-Incidentes-y-migraciones.md) | Incidentes de la plataforma, migraciones y auditoría |
