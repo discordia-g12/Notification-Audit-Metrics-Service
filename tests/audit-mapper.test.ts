@@ -166,6 +166,18 @@ describe('Audit Event Mapper', () => {
     assert.strictEqual(rPerms?.action, 'ROLE_PERMISSIONS_UPDATE');
     assert.deepStrictEqual(rPerms?.changes, { permissions: { old: 128, new: 256 } });
 
+    // role.permissions_updated with bitmask fallback
+    const rPermsBitmask = mapEventToAuditLog('role.permissions_updated', {
+      server_id: 'srv-1',
+      role_id: 'r-2',
+      name: 'Mod',
+      old_permissions_bitmask: 0,
+      new_permissions_bitmask: 1024,
+      updated_by: 'admin-1',
+    });
+    assert.strictEqual(rPermsBitmask?.action, 'ROLE_PERMISSIONS_UPDATE');
+    assert.deepStrictEqual(rPermsBitmask?.changes, { permissions: { old: 0, new: 1024 } });
+
     // role.deleted
     const rDelete = mapEventToAuditLog('role.deleted', {
       server_id: 'srv-1',

@@ -170,7 +170,9 @@ export function mapEventToAuditLog(
         },
       };
 
-    case 'role.permissions_updated':
+    case 'role.permissions_updated': {
+      const oldVal = payload.old_permissions ?? payload.old_permissions_bitmask ?? 0;
+      const newVal = payload.new_permissions ?? payload.new_permissions_bitmask ?? 0;
       return {
         eventId,
         serverId,
@@ -180,14 +182,15 @@ export function mapEventToAuditLog(
         targetId: extractTarget(payload.role_id),
         changes: {
           permissions: {
-            old: payload.old_permissions,
-            new: payload.new_permissions,
+            old: oldVal,
+            new: newVal,
           },
         },
         metadata: {
           name: payload.name,
         },
       };
+    }
 
     case 'role.deleted':
       return {
