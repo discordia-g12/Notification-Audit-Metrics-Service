@@ -3,12 +3,13 @@
 Servicio de notificaciones, auditoría y métricas de Discordia (Node.js 20, TypeScript, Fastify 4 y
 PostgreSQL).
 
-**Estado actual:** tiene el servidor, la conexión a PostgreSQL, los health checks, el pipeline de CI/CD y el
+**Estado actual:** tiene el servidor, la conexión a PostgreSQL, los health checks, el pipeline de CI/CD, el
 **estado de la plataforma** con sus **incidentes** (`/api/v1/status`, `/api/v1/admin/status` y
 `/api/v1/admin/incidents`, ver [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) y
-[ADR-03](docs/ADR-03-Incidentes-y-migraciones.md)). Las tablas se crean con migraciones al arrancar.
-Notificaciones, auditoría y métricas todavía no están: el Gateway ya le enruta `/api/v1/notifications`,
-`/api/v1/audit` y `/api/v1/metrics` (solo `staff`), y hoy esas rutas responden `404`.
+[ADR-03](docs/ADR-03-Incidentes-y-migraciones.md)), y el **registro de auditoría de moderación de servidores**
+(`GET /api/v1/servers/:serverId/audit-logs`, ver [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)).
+Notificaciones y métricas todavía no están: el Gateway ya le enruta `/api/v1/notifications` y `/api/v1/metrics`
+(solo `staff`), y hoy esas rutas responden `404`.
 
 ## Requisitos
 
@@ -55,6 +56,8 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 | `STATUS_TLS_INSECURE` | `false` | `true` desactiva la verificación del certificado **solo** en las sondas de estado (el Origin Certificate de Cloudflare y el autofirmado local no los valida Node) |
 | `STATUS_POLL_INTERVAL_MS` | `15000` | Cada cuánto se sondea (1000 a 3600000) |
 | `STATUS_PROBE_TIMEOUT_MS` | `2000` | Timeout de cada sonda (100 a 60000, menor que el intervalo) |
+| `RABBITMQ_URL` | `amqp://admin:admin@rabbitmq:5672/` | Conexión al broker RabbitMQ para consumir eventos de auditoría |
+| `SERVER_ROLES_URL` | `http://localhost:8000` | URL interna de Server-Roles-Core para validación de permisos de moderador |
 
 Un valor inválido en las `STATUS_*` corta el arranque.
 
@@ -69,6 +72,7 @@ Un valor inválido en las `STATUS_*` corta el arranque.
 | `POST` | `/api/v1/admin/incidents` | Publicar un incidente, solo `staff` (CA1) |
 | `GET` | `/api/v1/admin/incidents` | Historial (`?status=active\|resolved&limit=1..100&before=<ISO>`), solo `staff` |
 | `POST` | `/api/v1/admin/incidents/{id}/resolve` | Resolver (`{"note"?}`), solo `staff` (CA2). `404` si no existe, `409` si ya estaba resuelto |
+| `GET` | `/api/v1/servers/{serverId}/audit-logs` | Registro de auditoría de moderación de un servidor (HU 61, [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)) |
 
 El contrato completo está en [`docs/openapi.yaml`](docs/openapi.yaml).
 
@@ -157,7 +161,8 @@ src/
 ├── db/           migrate.ts (runner con advisory lock) y migrations.ts (las migraciones, en orden)
 ├── modules/
 │   ├── status/   monitor en memoria, sondas HTTP, catálogo de servicios, estado combinado, vistas y rutas
-│   └── incidents/ store en Postgres (con auditoría), caché de activos, vistas y rutas de staff
+│   ├── incidents/ store en Postgres (con auditoría), caché de activos, vistas y rutas de staff
+│   └── audit/     almacenamiento en Postgres, consumidor RabbitMQ, permisos y endpoint de auditoría de servidores
 ├── utils/        db-check.ts (SELECT 1 con timeout) y problem.ts (respuestas application/problem+json)
 ├── plugins/      (vacío)
 tests/
@@ -180,3 +185,4 @@ tests/
 | [ADR-01](docs/ADR-01-CI-CD-Pipeline.md) | Pipeline de CI/CD |
 | [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) | Estado de la plataforma por sondeo de `/readyz` vía Kong |
 | [ADR-03](docs/ADR-03-Incidentes-y-migraciones.md) | Incidentes de la plataforma, migraciones y auditoría |
+| [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md) | Registro de auditoría de moderación de servidores y consumo de eventos (HU 61) |

@@ -1,11 +1,12 @@
 openapi: 3.1.0
 info:
-  title: Notification-Audit-Metrics-Service — estado de la plataforma e incidentes
+  title: Notification-Audit-Metrics-Service — estado, incidentes y auditoría
   version: 1.0.0
   description: |
-    Estado de la plataforma (ADR-02) e incidentes (ADR-03), historia 74. Las rutas `/api/v1/admin/*` pasan por
-    Kong con `validate("staff")`; el servicio vuelve a chequear `X-User-Role` (y `X-User-Id` para escribir), que
-    pone Kong desde el token. Errores en `application/problem+json`.
+    Estado de la plataforma (ADR-02), incidentes (ADR-03) y registro de auditoría de moderación de servidores (ADR-04).
+    Las rutas `/api/v1/admin/*` pasan por Kong con `validate("staff")`; el servicio vuelve a chequear `X-User-Role`
+    (y `X-User-Id` para escribir). Las rutas de auditoría de servidor `/api/v1/servers/{serverId}/audit-logs`
+    verifican membresía y permisos de moderador contra Server-Roles. Errores en `application/problem+json`.
 servers:
   - url: https://api.discordia.lol
     description: Producción, a través de Kong
@@ -130,6 +131,51 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+  /api/v1/servers/{serverId}/audit-logs:
+    get:
+      summary: Registro de auditoría de moderación de un servidor (HU 61, ADR-04)
+      security: [{ bearer: [] }]
+      parameters:
+        - name: serverId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: category
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/AuditCategory' }
+        - name: action
+          in: query
+          required: false
+          schema: { type: string }
+        - name: actorId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: targetId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: before
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Página de registros de auditoría
+          headers:
+            Cache-Control: { schema: { const: no-store, private } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLogPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
 
 components:
   securitySchemes:
@@ -261,3 +307,41 @@ components:
             properties:
               field: { type: string }
               message: { type: string }
+    AuditCategory:
+      type: string
+      enum: [member, role, channel, category, server, invite, message]
+    AuditLogEntry:
+      type: object
+      required: [id, serverId, category, action, actor, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        eventId: { type: string }
+        serverId: { type: string, format: uuid }
+        category: { $ref: '#/components/schemas/AuditCategory' }
+        action: { type: string }
+        actor:
+          type: object
+          required: [id]
+          properties:
+            id: { type: string }
+            name: { type: string }
+        target:
+          type: object
+          required: [type]
+          properties:
+            type: { type: string }
+            id: { type: string }
+            name: { type: string }
+        reason: { type: [string, 'null'] }
+        changes: { type: object, additionalProperties: true }
+        metadata: { type: object, additionalProperties: true }
+        createdAt: { type: string, format: date-time }
+    AuditLogPage:
+      type: object
+      required: [items, nextBefore, hasMore]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AuditLogEntry' }
+        nextBefore: { type: [string, 'null'], format: date-time }
+        hasMore: { type: boolean }

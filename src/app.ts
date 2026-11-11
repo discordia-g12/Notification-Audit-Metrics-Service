@@ -11,11 +11,17 @@ import {
   type IncidentStore,
 } from './modules/incidents';
 import { createStatusMonitor, statusRoutes, type StatusSource } from './modules/status';
+import {
+  initAuditDatabase,
+  auditRoutes,
+  AuditConsumer,
+  type checkServerModeratorAccess,
+} from './modules/audit';
 import { createDatabaseCheck } from './utils/db-check';
 
 const READYZ_TIMEOUT_MS = 2000;
 
-interface BuildAppOptions {
+export interface BuildAppOptions {
   databaseUrl?: string;
   /** Variables de entorno para la config (default process.env). Los tests pasan las suyas. */
   env?: Record<string, string | undefined>;
@@ -26,6 +32,14 @@ interface BuildAppOptions {
   /** Aplica las migraciones pendientes antes de quedar lista (server.ts). Los tests migran por su cuenta. */
   migrate?: boolean;
   logger?: boolean;
+  /** Reemplaza el pool de Postgres (tests). */
+  pool?: Pool;
+  /** Deshabilita el consumidor de RabbitMQ (para tests). */
+  disableAuditConsumer?: boolean;
+  /** Reemplaza el AuditConsumer (tests). */
+  auditConsumer?: { start(): void; stop(): Promise<void> };
+  /** Reemplaza el check de permisos de moderación (tests). */
+  checkModeratorAccess?: typeof checkServerModeratorAccess;
 }
 
 function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -38,11 +52,13 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     env.DATABASE_URL ||
     'postgresql://postgres:password@127.0.0.1:5432/notification_db';
 
-  const pool = new Pool({
-    connectionString: databaseUrl,
-    connectionTimeoutMillis: READYZ_TIMEOUT_MS,
-    max: 5,
-  });
+  const pool =
+    options.pool ??
+    new Pool({
+      connectionString: databaseUrl,
+      connectionTimeoutMillis: READYZ_TIMEOUT_MS,
+      max: 5,
+    });
 
   pool.on('error', (err) => app.log.error(err, 'Postgres pool error'));
 
@@ -86,13 +102,37 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
   }
 
+  app.register(auditRoutes, {
+    pool,
+    serverRolesUrl: env.SERVER_ROLES_URL,
+    checkAccess: options.checkModeratorAccess,
+  });
+
+  const auditConsumer =
+    options.auditConsumer ??
+    (options.disableAuditConsumer
+      ? null
+      : new AuditConsumer({
+          pool,
+          url: env.RABBITMQ_URL,
+          exchange: env.RABBITMQ_EXCHANGE,
+          queue: env.RABBITMQ_QUEUE,
+          logger: app.log.child({ module: 'audit' }),
+        }));
+
   // Primera ronda al quedar lista la app, sin esperarla: no demora el listen.
   app.addHook('onReady', async () => {
+    try {
+      await initAuditDatabase(pool);
+    } catch (err) {
+      app.log.warn({ err }, 'Could not initialize audit database schema');
+    }
     statusMonitor.start();
+    auditConsumer?.start();
   });
 
   app.addHook('onClose', async () => {
-    // Primero el monitor (espera la ronda en curso, que puede estar usando el pool).
+    await auditConsumer?.stop();
     await statusMonitor.stop();
     await pool.end();
   });
