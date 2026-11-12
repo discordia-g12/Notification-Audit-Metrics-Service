@@ -7,9 +7,10 @@ PostgreSQL).
 **estado de la plataforma** con sus **incidentes** (`/api/v1/status`, `/api/v1/admin/status` y
 `/api/v1/admin/incidents`, ver [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) y
 [ADR-03](docs/ADR-03-Incidentes-y-migraciones.md)), y el **registro de auditoría de moderación de servidores**
-(`GET /api/v1/servers/:serverId/audit-logs`, ver [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)).
-Notificaciones y métricas todavía no están: el Gateway ya le enruta `/api/v1/notifications` y `/api/v1/metrics`
-(solo `staff`), y hoy esas rutas responden `404`.
+(`GET /api/v1/servers/:serverId/audit-logs`, ver [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)),
+y las **métricas globales** del backoffice (`GET /api/v1/admin/metrics`, ver
+[ADR-05](docs/ADR-05-Metricas-globales.md)). Notificaciones todavía no están: el Gateway ya le enruta
+`/api/v1/notifications` y hoy responde `404`.
 
 ## Requisitos
 
@@ -58,8 +59,10 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 | `STATUS_PROBE_TIMEOUT_MS` | `2000` | Timeout de cada sonda (100 a 60000, menor que el intervalo) |
 | `RABBITMQ_URL` | `amqp://admin:admin@rabbitmq:5672/` | Conexión al broker RabbitMQ para consumir eventos de auditoría |
 | `SERVER_ROLES_URL` | `http://localhost:8000` | URL interna de Server-Roles-Core para validación de permisos de moderador |
+| `CHAT_ENGINE_URL` | `http://localhost:3000` | Base de Chat-Engine para las métricas (`/internal/metrics/messages`). En prod, mismo nodo realtime |
+| `CORE_SERVICE_URL` | `http://localhost:8002` | Base de Server-Roles-Core para las métricas (`/internal/metrics/servers`). En prod, `http://<EDGE_HOST>:8002` |
 
-Un valor inválido en las `STATUS_*` corta el arranque.
+Un valor inválido en las `STATUS_*`, `CHAT_ENGINE_URL` o `CORE_SERVICE_URL` corta el arranque.
 
 ## API
 
@@ -72,6 +75,7 @@ Un valor inválido en las `STATUS_*` corta el arranque.
 | `POST` | `/api/v1/admin/incidents` | Publicar un incidente, solo `staff` (CA1) |
 | `GET` | `/api/v1/admin/incidents` | Historial (`?status=active\|resolved&limit=1..100&before=<ISO>`), solo `staff` |
 | `POST` | `/api/v1/admin/incidents/{id}/resolve` | Resolver (`{"note"?}`), solo `staff` (CA2). `404` si no existe, `409` si ya estaba resuelto |
+| `GET` | `/api/v1/admin/metrics` | Métricas globales del período (`?from=<ISO>&to=<ISO>`), solo `staff` ([ADR-05](docs/ADR-05-Metricas-globales.md)) |
 | `GET` | `/api/v1/servers/{serverId}/audit-logs` | Registro de auditoría de moderación de un servidor (HU 61, [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)) |
 
 El contrato completo está en [`docs/openapi.yaml`](docs/openapi.yaml).
@@ -131,6 +135,31 @@ del cliente se borra y lo pone el Gateway desde el token: `/api/v1/admin/status`
 rol `staff` (ADR-002 del Gateway). Lo mismo para `/api/v1/admin/incidents`. Sin `STATUS_GATEWAY_URL` todo lo que va por Kong sale `unknown`; para
 sondear el Kong local: `STATUS_GATEWAY_URL=https://localhost:8443 STATUS_TLS_INSECURE=true npm run dev`.
 
+### Métricas globales
+
+Para el backoffice: usuarios activos, servidores creados y mensajes enviados en toda la plataforma, en el
+período `[from, to)`. Sin parámetros, los últimos 30 días (`to` = ahora, al minuto). `400 problem+json` si una
+fecha no es ISO 8601, si `from >= to` o si el período supera 366 días. Necesita `X-User-Id` (si no, `401`) y
+`X-User-Role: staff` (si no, `403`).
+
+El servicio no guarda nada: en cada request consulta en paralelo a Chat (`/internal/metrics/messages`) y a
+Server-Roles (`/internal/metrics/servers`), con 2 s de timeout cada una. Si una no responde, sus campos van en
+`null`, `partial` en `true`, se loguea un `warn` y la respuesta es `200` igual. Las respuestas completas se
+reusan 60 s para el mismo período.
+
+```text
+GET /api/v1/admin/metrics?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z
+{ from, to, activeUsers, serversCreated, messagesSent, partial }
+```
+
+```bash
+curl -s -H 'X-User-Role: staff' -H 'X-User-Id: auth0|local' \
+  'localhost:3000/api/v1/admin/metrics?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z' | jq
+curl -si -H 'X-User-Role: user' -H 'X-User-Id: auth0|local' localhost:3000/api/v1/admin/metrics   # 403
+```
+
+Un offset con `+` en la query va como `%2B` (sin codificar, `+` llega como espacio y es `400`).
+
 ## Tests, lint y seguridad
 
 Los mismos comandos que corre el CI:
@@ -157,12 +186,13 @@ DATABASE_URL=postgresql://postgres:password@localhost:5434/notification_db npm r
 src/
 ├── server.ts     arranque
 ├── app.ts        app de Fastify, pool de PostgreSQL, /livez, /readyz, migraciones y registro de los módulos
-├── config/       status.ts: lectura y validación de las STATUS_*
+├── config/       status.ts y metrics.ts: lectura y validación de las STATUS_* y de las URLs de las métricas
 ├── db/           migrate.ts (runner con advisory lock) y migrations.ts (las migraciones, en orden)
 ├── modules/
 │   ├── status/   monitor en memoria, sondas HTTP, catálogo de servicios, estado combinado, vistas y rutas
 │   ├── incidents/ store en Postgres (con auditoría), caché de activos, vistas y rutas de staff
-│   └── audit/     almacenamiento en Postgres, consumidor RabbitMQ, permisos y endpoint de auditoría de servidores
+│   ├── audit/     almacenamiento en Postgres, consumidor RabbitMQ, permisos y endpoint de auditoría de servidores
+│   └── metrics/   métricas globales: período, consulta a Chat y Server-Roles, caché de 60 s y ruta de staff
 ├── utils/        db-check.ts (SELECT 1 con timeout) y problem.ts (respuestas application/problem+json)
 ├── plugins/      (vacío)
 tests/
@@ -186,3 +216,4 @@ tests/
 | [ADR-02](docs/ADR-02-Estado-de-la-plataforma.md) | Estado de la plataforma por sondeo de `/readyz` vía Kong |
 | [ADR-03](docs/ADR-03-Incidentes-y-migraciones.md) | Incidentes de la plataforma, migraciones y auditoría |
 | [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md) | Registro de auditoría de moderación de servidores y consumo de eventos (HU 61) |
+| [ADR-05](docs/ADR-05-Metricas-globales.md) | Métricas globales del backoffice por consulta síncrona a Chat y Server-Roles |
