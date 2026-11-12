@@ -1,5 +1,6 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import { Pool } from 'pg';
+import { loadMetricsConfig } from './config/metrics';
 import { loadStatusConfig } from './config/status';
 import { MIGRATIONS } from './db/migrations';
 import { runMigrations } from './db/migrate';
@@ -10,6 +11,15 @@ import {
   PgIncidentStore,
   type IncidentStore,
 } from './modules/incidents';
+import {
+  METRICS_CACHE_MAX_ENTRIES,
+  METRICS_CACHE_TTL_MS,
+  METRICS_SOURCE_TIMEOUT_MS,
+  MetricsCache,
+  MetricsSources,
+  metricsRoutes,
+  type FetchFn,
+} from './modules/metrics';
 import { createStatusMonitor, statusRoutes, type StatusSource } from './modules/status';
 import {
   initAuditDatabase,
@@ -40,12 +50,17 @@ export interface BuildAppOptions {
   auditConsumer?: { start(): void; stop(): Promise<void> };
   /** Reemplaza el check de permisos de moderación (tests). */
   checkModeratorAccess?: typeof checkServerModeratorAccess;
+  /** Reemplaza el fetch de las consultas de métricas a Chat y Server-Roles (tests). */
+  metricsFetch?: FetchFn;
+  /** Timeout de cada consulta de métricas (tests; default METRICS_SOURCE_TIMEOUT_MS). */
+  metricsTimeoutMs?: number;
 }
 
 function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: options.logger ?? true });
   const env = options.env ?? process.env;
   const statusConfig = loadStatusConfig(env);
+  const metricsConfig = loadMetricsConfig(env);
 
   const databaseUrl =
     options.databaseUrl ||
@@ -93,6 +108,14 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   app.register(statusRoutes, { monitor: statusMonitor, incidents: activeIncidents });
   app.register(incidentRoutes, { store: incidentStore, activeIncidents });
+  app.register(metricsRoutes, {
+    sources: new MetricsSources({
+      ...metricsConfig,
+      timeoutMs: options.metricsTimeoutMs ?? METRICS_SOURCE_TIMEOUT_MS,
+      fetchFn: options.metricsFetch,
+    }),
+    cache: new MetricsCache({ ttlMs: METRICS_CACHE_TTL_MS, maxEntries: METRICS_CACHE_MAX_ENTRIES }),
+  });
 
   // Antes que el monitor: si una migración falla, ready() rechaza, el listen no ocurre y el contenedor no
   // queda healthy (el deploy vuelve a la imagen anterior).

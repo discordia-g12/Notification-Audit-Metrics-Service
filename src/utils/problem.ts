@@ -2,6 +2,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 const TITLES = new Map<number, string>([
   [400, 'Bad Request'],
+  [401, 'Unauthorized'],
   [403, 'Forbidden'],
   [404, 'Not Found'],
   [409, 'Conflict'],

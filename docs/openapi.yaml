@@ -1,9 +1,10 @@
 openapi: 3.1.0
 info:
-  title: Notification-Audit-Metrics-Service — estado, incidentes y auditoría
+  title: Notification-Audit-Metrics-Service — estado, incidentes, auditoría y métricas
   version: 1.0.0
   description: |
-    Estado de la plataforma (ADR-02), incidentes (ADR-03) y registro de auditoría de moderación de servidores (ADR-04).
+    Estado de la plataforma (ADR-02), incidentes (ADR-03), registro de auditoría de moderación de servidores (ADR-04)
+    y métricas globales para el backoffice (ADR-05).
     Las rutas `/api/v1/admin/*` pasan por Kong con `validate("staff")`; el servicio vuelve a chequear `X-User-Role`
     (y `X-User-Id` para escribir). Las rutas de auditoría de servidor `/api/v1/servers/{serverId}/audit-logs`
     verifican membresía y permisos de moderador contra Server-Roles. Errores en `application/problem+json`.
@@ -131,6 +132,34 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+  /api/v1/admin/metrics:
+    get:
+      summary: Métricas globales de la plataforma en un período (staff, ADR-05)
+      description: |
+        Agrega en el momento los conteos de Chat (mensajes y usuarios activos) y Server-Roles (servidores creados).
+        Si una fuente falla o tarda más de 2 s, sus campos van en `null` y `partial: true`; nunca 5xx por eso.
+        Las respuestas completas se reusan 60 s para el mismo período.
+      security: [{ bearer: [] }]
+      parameters:
+        - name: from
+          in: query
+          description: Inicio del período (incluido), ISO 8601. Default `to` menos 30 días.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Fin del período (excluido), ISO 8601. Default ahora, truncado al minuto. Hasta 366 días después de `from`.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Conteos del período (null si la fuente no respondió)
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformMetrics' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/v1/servers/{serverId}/audit-logs:
     get:
       summary: Registro de auditoría de moderación de un servidor (HU 61, ADR-04)
@@ -188,7 +217,7 @@ components:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
     Unauthorized:
-      description: Sin token o token inválido (lo responde Kong)
+      description: Sin token o token inválido (lo responde Kong), o falta X-User-Id en una ruta que lo exige
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -307,6 +336,19 @@ components:
             properties:
               field: { type: string }
               message: { type: string }
+    PlatformMetrics:
+      type: object
+      required: [from, to, activeUsers, serversCreated, messagesSent, partial]
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        activeUsers:
+          type: [integer, 'null']
+          minimum: 0
+          description: Usuarios que enviaron al menos un mensaje (canal o DM) en el período
+        serversCreated: { type: [integer, 'null'], minimum: 0, description: Servidores creados en el período que siguen existiendo }
+        messagesSent: { type: [integer, 'null'], minimum: 0, description: Mensajes enviados en el período (canales y DMs) }
+        partial: { type: boolean, description: true si alguna fuente no respondió }
     AuditCategory:
       type: string
       enum: [member, role, channel, category, server, invite, message]
