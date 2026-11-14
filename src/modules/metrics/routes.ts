@@ -1,13 +1,19 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { sendProblem } from '../../utils/problem';
 import { requireStaff } from '../status/routes';
-import type { MetricsCache } from './cache';
+import { MetricsCache, type MetricsCacheOptions } from './cache';
 import { resolveRange } from './range';
+import { serverMetricsRoutes } from './serverRoutes';
+import type { ServerActivityMetrics, ServerAdminAccessResult, ServerMetricsCollectorConfig } from './serverMetrics';
 import type { MetricsSources } from './sources';
 
 export interface MetricsRoutesOptions {
   sources: MetricsSources;
   cache?: MetricsCache;
+  serverConfig?: ServerMetricsCollectorConfig;
+  serverCache?: MetricsCache<ServerActivityMetrics>;
+  serverCacheOptions?: MetricsCacheOptions;
+  checkServerAdminAccess?: (userId: string, serverId: string) => Promise<ServerAdminAccessResult>;
   now?: () => Date;
 }
 
@@ -50,4 +56,18 @@ export async function metricsRoutes(app: FastifyInstance, options: MetricsRoutes
       return metrics;
     },
   );
+
+  if (options.serverConfig) {
+    const serverCache =
+      options.serverCache ??
+      (options.serverCacheOptions
+        ? new MetricsCache<ServerActivityMetrics>(options.serverCacheOptions)
+        : undefined);
+    await serverMetricsRoutes(app, {
+      serverConfig: options.serverConfig,
+      cache: serverCache,
+      now: options.now,
+      checkAdminAccess: options.checkServerAdminAccess,
+    });
+  }
 }
