@@ -1,35 +1,79 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import { Pool } from 'pg';
+import { loadMetricsConfig } from './config/metrics';
 import { loadStatusConfig } from './config/status';
+import { MIGRATIONS } from './db/migrations';
+import { runMigrations } from './db/migrate';
+import {
+  ACTIVE_INCIDENTS_TTL_MS,
+  ActiveIncidentsCache,
+  incidentRoutes,
+  PgIncidentStore,
+  type IncidentStore,
+} from './modules/incidents';
+import {
+  METRICS_CACHE_MAX_ENTRIES,
+  METRICS_CACHE_TTL_MS,
+  METRICS_SOURCE_TIMEOUT_MS,
+  MetricsCache,
+  MetricsSources,
+  metricsRoutes,
+  type FetchFn,
+} from './modules/metrics';
 import { createStatusMonitor, statusRoutes, type StatusSource } from './modules/status';
+import {
+  initAuditDatabase,
+  auditRoutes,
+  AuditConsumer,
+  type checkServerModeratorAccess,
+} from './modules/audit';
 import { createDatabaseCheck } from './utils/db-check';
 
 const READYZ_TIMEOUT_MS = 2000;
 
-interface BuildAppOptions {
+export interface BuildAppOptions {
   databaseUrl?: string;
   /** Variables de entorno para la config (default process.env). Los tests pasan las suyas. */
   env?: Record<string, string | undefined>;
   /** Reemplaza el monitor de estado real (tests). */
   statusMonitor?: StatusSource;
+  /** Reemplaza el store de incidentes en Postgres (tests). */
+  incidentStore?: IncidentStore;
+  /** Aplica las migraciones pendientes antes de quedar lista (server.ts). Los tests migran por su cuenta. */
+  migrate?: boolean;
   logger?: boolean;
+  /** Reemplaza el pool de Postgres (tests). */
+  pool?: Pool;
+  /** Deshabilita el consumidor de RabbitMQ (para tests). */
+  disableAuditConsumer?: boolean;
+  /** Reemplaza el AuditConsumer (tests). */
+  auditConsumer?: { start(): void; stop(): Promise<void> };
+  /** Reemplaza el check de permisos de moderación (tests). */
+  checkModeratorAccess?: typeof checkServerModeratorAccess;
+  /** Reemplaza el fetch de las consultas de métricas a Chat y Server-Roles (tests). */
+  metricsFetch?: FetchFn;
+  /** Timeout de cada consulta de métricas (tests; default METRICS_SOURCE_TIMEOUT_MS). */
+  metricsTimeoutMs?: number;
 }
 
 function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: options.logger ?? true });
   const env = options.env ?? process.env;
   const statusConfig = loadStatusConfig(env);
+  const metricsConfig = loadMetricsConfig(env);
 
   const databaseUrl =
     options.databaseUrl ||
     env.DATABASE_URL ||
     'postgresql://postgres:password@127.0.0.1:5432/notification_db';
 
-  const pool = new Pool({
-    connectionString: databaseUrl,
-    connectionTimeoutMillis: READYZ_TIMEOUT_MS,
-    max: 5,
-  });
+  const pool =
+    options.pool ??
+    new Pool({
+      connectionString: databaseUrl,
+      connectionTimeoutMillis: READYZ_TIMEOUT_MS,
+      max: 5,
+    });
 
   pool.on('error', (err) => app.log.error(err, 'Postgres pool error'));
 
@@ -55,15 +99,72 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       createDatabaseCheck(pool, statusConfig.probeTimeoutMs),
       app.log.child({ module: 'status' }),
     );
-  app.register(statusRoutes, { monitor: statusMonitor });
+  const incidentStore = options.incidentStore ?? new PgIncidentStore(pool);
+  const activeIncidents = new ActiveIncidentsCache({
+    load: () => incidentStore.listActive(),
+    ttlMs: ACTIVE_INCIDENTS_TTL_MS,
+    logger: app.log.child({ module: 'incidents' }),
+  });
+
+  app.register(statusRoutes, { monitor: statusMonitor, incidents: activeIncidents });
+  app.register(incidentRoutes, { store: incidentStore, activeIncidents });
+  app.register(metricsRoutes, {
+    sources: new MetricsSources({
+      ...metricsConfig,
+      timeoutMs: options.metricsTimeoutMs ?? METRICS_SOURCE_TIMEOUT_MS,
+      fetchFn: options.metricsFetch,
+    }),
+    cache: new MetricsCache({ ttlMs: METRICS_CACHE_TTL_MS, maxEntries: METRICS_CACHE_MAX_ENTRIES }),
+    serverConfig: {
+      chatEngineUrl: metricsConfig.chatEngineUrl,
+      coreServiceUrl: options.env?.CORE_SERVICE_URL
+        ? metricsConfig.coreServiceUrl
+        : (env.SERVER_ROLES_URL ?? metricsConfig.coreServiceUrl),
+      timeoutMs: options.metricsTimeoutMs ?? METRICS_SOURCE_TIMEOUT_MS,
+      fetchFn: options.metricsFetch,
+    },
+    serverCacheOptions: { ttlMs: METRICS_CACHE_TTL_MS, maxEntries: METRICS_CACHE_MAX_ENTRIES },
+  });
+
+  // Antes que el monitor: si una migración falla, ready() rechaza, el listen no ocurre y el contenedor no
+  // queda healthy (el deploy vuelve a la imagen anterior).
+  if (options.migrate) {
+    app.addHook('onReady', async () => {
+      await runMigrations(pool, MIGRATIONS, app.log.child({ module: 'migrations' }));
+    });
+  }
+
+  app.register(auditRoutes, {
+    pool,
+    serverRolesUrl: env.SERVER_ROLES_URL,
+    checkAccess: options.checkModeratorAccess,
+  });
+
+  const auditConsumer =
+    options.auditConsumer ??
+    (options.disableAuditConsumer
+      ? null
+      : new AuditConsumer({
+          pool,
+          url: env.RABBITMQ_URL,
+          exchange: env.RABBITMQ_EXCHANGE,
+          queue: env.RABBITMQ_QUEUE,
+          logger: app.log.child({ module: 'audit' }),
+        }));
 
   // Primera ronda al quedar lista la app, sin esperarla: no demora el listen.
   app.addHook('onReady', async () => {
+    try {
+      await initAuditDatabase(pool);
+    } catch (err) {
+      app.log.warn({ err }, 'Could not initialize audit database schema');
+    }
     statusMonitor.start();
+    auditConsumer?.start();
   });
 
   app.addHook('onClose', async () => {
-    // Primero el monitor (espera la ronda en curso, que puede estar usando el pool).
+    await auditConsumer?.stop();
     await statusMonitor.stop();
     await pool.end();
   });

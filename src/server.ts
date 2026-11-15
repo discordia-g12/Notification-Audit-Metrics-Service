@@ -1,7 +1,7 @@
 import buildApp from './app';
 
 const start = async (): Promise<void> => {
-  const app = buildApp();
+  const app = buildApp({ migrate: true });
   const port = Number(process.env.PORT) || 3000;
   const host = '0.0.0.0';
 
