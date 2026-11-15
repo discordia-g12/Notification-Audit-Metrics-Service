@@ -11,15 +11,15 @@ export interface MetricsCacheOptions {
  * Caché en memoria por período (from|to normalizados a ISO). Solo guarda respuestas completas: una parcial se
  * vuelve a pedir en la próxima request, así el dato aparece apenas la fuente se recupera.
  */
-export class MetricsCache {
-  private readonly entries = new Map<string, { value: PlatformMetrics; expiresAt: number }>();
+export class MetricsCache<T extends { partial: boolean } = PlatformMetrics> {
+  private readonly entries = new Map<string, { value: T; expiresAt: number }>();
   private readonly now: () => number;
 
   constructor(private readonly options: MetricsCacheOptions) {
     this.now = options.now ?? Date.now;
   }
 
-  get(key: string): PlatformMetrics | undefined {
+  get(key: string): T | undefined {
     const entry = this.entries.get(key);
     if (!entry) return undefined;
     if (entry.expiresAt <= this.now()) {
@@ -29,7 +29,7 @@ export class MetricsCache {
     return entry.value;
   }
 
-  set(key: string, value: PlatformMetrics): void {
+  set(key: string, value: T): void {
     if (value.partial) return;
     this.entries.delete(key);
     if (this.entries.size >= this.options.maxEntries) {

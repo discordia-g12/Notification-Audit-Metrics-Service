@@ -115,6 +115,15 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       fetchFn: options.metricsFetch,
     }),
     cache: new MetricsCache({ ttlMs: METRICS_CACHE_TTL_MS, maxEntries: METRICS_CACHE_MAX_ENTRIES }),
+    serverConfig: {
+      chatEngineUrl: metricsConfig.chatEngineUrl,
+      coreServiceUrl: options.env?.CORE_SERVICE_URL
+        ? metricsConfig.coreServiceUrl
+        : (env.SERVER_ROLES_URL ?? metricsConfig.coreServiceUrl),
+      timeoutMs: options.metricsTimeoutMs ?? METRICS_SOURCE_TIMEOUT_MS,
+      fetchFn: options.metricsFetch,
+    },
+    serverCacheOptions: { ttlMs: METRICS_CACHE_TTL_MS, maxEntries: METRICS_CACHE_MAX_ENTRIES },
   });
 
   // Antes que el monitor: si una migración falla, ready() rechaza, el listen no ocurre y el contenedor no

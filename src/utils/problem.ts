@@ -8,6 +8,7 @@ const TITLES = new Map<number, string>([
   [409, 'Conflict'],
   [415, 'Unsupported Media Type'],
   [500, 'Internal Server Error'],
+  [503, 'Service Unavailable'],
 ]);
 
 export interface ProblemExtras {
