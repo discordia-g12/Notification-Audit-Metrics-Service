@@ -76,6 +76,7 @@ Un valor inválido en las `STATUS_*`, `CHAT_ENGINE_URL` o `CORE_SERVICE_URL` cor
 | `GET` | `/api/v1/admin/incidents` | Historial (`?status=active\|resolved&limit=1..100&before=<ISO>`), solo `staff` |
 | `POST` | `/api/v1/admin/incidents/{id}/resolve` | Resolver (`{"note"?}`), solo `staff` (CA2). `404` si no existe, `409` si ya estaba resuelto |
 | `GET` | `/api/v1/admin/metrics` | Métricas globales del período (`?from=<ISO>&to=<ISO>`), solo `staff` ([ADR-05](docs/ADR-05-Metricas-globales.md)) |
+| `GET` | `/api/v1/servers/{serverId}/metrics` | Métricas de actividad del servidor (`?days=` o `?from=&to=`), solo dueño, `ADMINISTRATOR` o `MANAGE_SERVER`. Con `?format=csv`, la serie diaria como archivo CSV descargable ([ADR-06](docs/ADR-06-Exportacion-de-metricas-a-CSV.md)) |
 | `GET` | `/api/v1/servers/{serverId}/audit-logs` | Registro de auditoría de moderación de un servidor (HU 61, [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)) |
 
 El contrato completo está en [`docs/openapi.yaml`](docs/openapi.yaml).
