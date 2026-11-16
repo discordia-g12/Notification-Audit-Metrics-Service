@@ -10,6 +10,7 @@ import {
   type ServerAdminAccessResult,
   type ServerMetricsCollectorConfig,
 } from './serverMetrics';
+import { CSV_CONTENT_TYPE, parseExportFormat, serverMetricsCsvFilename, serverMetricsToCsv } from './serverMetricsCsv';
 
 export interface ServerMetricsRoutesOptions {
   serverConfig: ServerMetricsCollectorConfig;
@@ -26,11 +27,13 @@ interface ServerMetricsQuery {
   from?: unknown;
   to?: unknown;
   days?: unknown;
+  format?: unknown;
 }
 
 /**
  * Expone métricas de actividad de un servidor (`GET /api/v1/servers/:serverId/metrics`)
  * restringidas a su dueño o miembros con permiso `ADMINISTRATOR` o `MANAGE_SERVER`.
+ * Con `?format=csv` devuelve la serie diaria como archivo CSV descargable (ADR-06).
  */
 export async function serverMetricsRoutes(
   app: FastifyInstance,
@@ -58,9 +61,10 @@ export async function serverMetricsRoutes(
       }
 
       const parsedRange = resolveServerMetricsRange(request.query ?? {}, now());
-      if (!parsedRange.ok) {
+      const parsedFormat = parseExportFormat(request.query?.format);
+      if (!parsedRange.ok || !parsedFormat.ok) {
         return sendProblem(request, reply, 400, 'La solicitud tiene campos inválidos', {
-          errors: parsedRange.errors,
+          errors: [...(parsedRange.ok ? [] : parsedRange.errors), ...(parsedFormat.ok ? [] : parsedFormat.errors)],
         });
       }
 
@@ -91,18 +95,34 @@ export async function serverMetricsRoutes(
 
       const { range } = parsedRange;
       const cacheKey = `${serverId}|${range.from.toISOString()}|${range.to.toISOString()}`;
-      const cached = cache?.get(cacheKey);
-      if (cached) {
-        return cached;
+      let metrics = cache?.get(cacheKey);
+      if (!metrics) {
+        const result = await collectServerActivityMetrics(serverId, range, serverConfig, request.log);
+        if (result.notFound) {
+          return sendProblem(request, reply, 404, 'Server not found');
+        }
+        metrics = result.metrics;
+        cache?.set(cacheKey, metrics);
       }
 
-      const result = await collectServerActivityMetrics(serverId, range, serverConfig, request.log);
-      if (result.notFound) {
-        return sendProblem(request, reply, 404, 'Server not found');
+      if (parsedFormat.format === 'json') {
+        return metrics;
       }
 
-      cache?.set(cacheKey, result.metrics);
-      return result.metrics;
+      // Un archivo sale de la plataforma sin el aviso de "datos parciales": exportarlo con columnas vacías
+      // haría analizar datos incompletos sin saberlo. Se pide reintentar (la caché no guarda parciales).
+      if (metrics.partial) {
+        return sendProblem(
+          request,
+          reply,
+          503,
+          'No se pudieron obtener todas las métricas del período. Probá exportar de nuevo en unos minutos.',
+        );
+      }
+      return reply
+        .header('content-type', CSV_CONTENT_TYPE)
+        .header('content-disposition', `attachment; filename="${serverMetricsCsvFilename(metrics)}"`)
+        .send(serverMetricsToCsv(metrics));
     },
   );
 }
