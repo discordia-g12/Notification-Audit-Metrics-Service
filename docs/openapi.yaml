@@ -4,7 +4,8 @@ info:
   version: 1.0.0
   description: |
     Estado de la plataforma (ADR-02), incidentes (ADR-03), registro de auditoría de moderación de servidores (ADR-04)
-    y métricas globales para el backoffice (ADR-05).
+    y métricas globales para el backoffice (ADR-05). Bandeja y preferencias de notificación del usuario (ADR-07):
+    `/api/v1/notifications` exige `X-User-Id` (lo pone Kong) y cada usuario solo ve y cambia lo suyo.
     Las rutas `/api/v1/admin/*` pasan por Kong con `validate("staff")`; el servicio vuelve a chequear `X-User-Role`
     (y `X-User-Id` para escribir). Las rutas de auditoría de servidor `/api/v1/servers/{serverId}/audit-logs`
     verifican membresía y permisos de moderador contra Server-Roles. Errores en `application/problem+json`.
@@ -254,6 +255,105 @@ paths:
         '404': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 
+  /api/v1/notifications:
+    get:
+      summary: Bandeja del usuario, de la más nueva a la más vieja (ADR-07)
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: unread, in: query, required: false, schema: { type: boolean, default: false } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - name: before
+          in: query
+          required: false
+          description: '`nextCursor` de la página anterior'
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Página de la bandeja. `unreadCount` tiene tope 100.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/{id}/read:
+    post:
+      summary: Marca una notificación propia como leída
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Leída (marcarla otra vez no cambia la hora) }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /api/v1/notifications/read-all:
+    post:
+      summary: Marca leídas todas las notificaciones propias
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Listo }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/preferences:
+    get:
+      summary: Preferencias de notificación del usuario
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: Hasta 500 preferencias
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/NotificationPreference' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/preferences/{scopeType}/{scopeId}:
+    parameters:
+      - { name: scopeType, in: path, required: true, schema: { $ref: '#/components/schemas/NotificationScopeType' } }
+      - name: scopeId
+        in: path
+        required: true
+        description: Id del servidor, del canal (o `dm-…`) o del mensaje raíz del hilo
+        schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }
+    put:
+      summary: Crea o cambia una preferencia. Solo cambia los campos que llegan.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              description: Tiene que traer al menos `level`, `muted` o `mutedUntil`.
+              properties:
+                level: { oneOf: [{ $ref: '#/components/schemas/NotificationLevel' }, { type: 'null' }] }
+                muted: { type: boolean }
+                mutedUntil: { type: [string, 'null'], format: date-time }
+                serverId: { type: string, description: 'Servidor del canal o del hilo, para limpiar al borrarlo' }
+      responses:
+        '200':
+          description: La preferencia como quedó
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreference' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      summary: Vuelve al default (borra la preferencia)
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Listo, existiera o no }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
 components:
   securitySchemes:
     bearer: { type: http, scheme: bearer, bearerFormat: JWT }
@@ -435,3 +535,45 @@ components:
           items: { $ref: '#/components/schemas/AuditLogEntry' }
         nextBefore: { type: [string, 'null'], format: date-time }
         hasMore: { type: boolean }
+    NotificationReason:
+      type: string
+      description: Hoy solo se genera `thread_reply`.
+      enum: [thread_reply, mention, dm]
+    NotificationLevel:
+      type: string
+      enum: [all, mentions, none]
+    NotificationScopeType:
+      type: string
+      enum: [server, channel, thread]
+    Notification:
+      type: object
+      required: [id, reason, serverId, channelId, threadId, messageId, actorId, preview, createdAt, readAt]
+      properties:
+        id: { type: string, format: uuid }
+        reason: { $ref: '#/components/schemas/NotificationReason' }
+        serverId: { type: [string, 'null'], description: '`null` en un DM' }
+        channelId: { type: string }
+        threadId: { type: [string, 'null'], description: Id del mensaje raíz del hilo }
+        messageId: { type: string }
+        actorId: { type: string, description: Quién escribió }
+        preview: { type: string, maxLength: 140 }
+        createdAt: { type: string, format: date-time }
+        readAt: { type: [string, 'null'], format: date-time }
+    NotificationPage:
+      type: object
+      required: [items, unreadCount, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+        unreadCount: { type: integer, minimum: 0, maximum: 100 }
+        nextCursor: { type: [string, 'null'], format: uuid }
+    NotificationPreference:
+      type: object
+      required: [scopeType, scopeId, serverId, level, muted, mutedUntil, updatedAt]
+      properties:
+        scopeType: { $ref: '#/components/schemas/NotificationScopeType' }
+        scopeId: { type: string }
+        serverId: { type: [string, 'null'] }
+        level: { oneOf: [{ $ref: '#/components/schemas/NotificationLevel' }, { type: 'null' }], description: '`null` hereda' }
+        muted: { type: boolean }
+        mutedUntil: { type: [string, 'null'], format: date-time }
+        updatedAt: { type: string, format: date-time }

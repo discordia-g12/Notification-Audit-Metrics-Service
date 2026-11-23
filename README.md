@@ -9,8 +9,9 @@ PostgreSQL).
 [ADR-03](docs/ADR-03-Incidentes-y-migraciones.md)), y el **registro de auditoría de moderación de servidores**
 (`GET /api/v1/servers/:serverId/audit-logs`, ver [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)),
 y las **métricas globales** del backoffice (`GET /api/v1/admin/metrics`, ver
-[ADR-05](docs/ADR-05-Metricas-globales.md)). Notificaciones todavía no están: el Gateway ya le enruta
-`/api/v1/notifications` y hoy responde `404`.
+[ADR-05](docs/ADR-05-Metricas-globales.md)), y la **bandeja y las preferencias de notificación**
+(`/api/v1/notifications`, ver [ADR-07](docs/ADR-07-Notificaciones-y-preferencias.md)). Hoy solo se generan
+avisos de respuestas en hilos; menciones, DMs y push son de la épica de notificaciones.
 
 ## Requisitos
 
@@ -61,6 +62,8 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 | `SERVER_ROLES_URL` | `http://localhost:8000` | URL interna de Server-Roles-Core para validación de permisos de moderador |
 | `CHAT_ENGINE_URL` | `http://localhost:3000` | Base de Chat-Engine para las métricas (`/internal/metrics/messages`). En prod, mismo nodo realtime |
 | `CORE_SERVICE_URL` | `http://localhost:8002` | Base de Server-Roles-Core para las métricas (`/internal/metrics/servers`). En prod, `http://<EDGE_HOST>:8002` |
+| `RABBITMQ_MESSAGE_QUEUE` | `notification_message_events` | Cola de `chat.message.created`, `channel.deleted` y `server.deleted` (aparte de la de auditoría). Lo que falla va a `<cola>.dlq` |
+| `INTERNAL_API_TOKEN` | (sin definir) | Secreto compartido con Chat para avisar en vivo por `/internal/inbox/events` (header `X-Internal-Token`). Tiene que ser el mismo que el de Chat |
 
 Un valor inválido en las `STATUS_*`, `CHAT_ENGINE_URL` o `CORE_SERVICE_URL` corta el arranque.
 
@@ -78,6 +81,12 @@ Un valor inválido en las `STATUS_*`, `CHAT_ENGINE_URL` o `CORE_SERVICE_URL` cor
 | `GET` | `/api/v1/admin/metrics` | Métricas globales del período (`?from=<ISO>&to=<ISO>`), solo `staff` ([ADR-05](docs/ADR-05-Metricas-globales.md)) |
 | `GET` | `/api/v1/servers/{serverId}/metrics` | Métricas de actividad del servidor (`?days=` o `?from=&to=`), solo dueño, `ADMINISTRATOR` o `MANAGE_SERVER`. Con `?format=csv`, la serie diaria como archivo CSV descargable ([ADR-06](docs/ADR-06-Exportacion-de-metricas-a-CSV.md)) |
 | `GET` | `/api/v1/servers/{serverId}/audit-logs` | Registro de auditoría de moderación de un servidor (HU 61, [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md)) |
+| `GET` | `/api/v1/notifications` | Bandeja del usuario (`?unread=true&limit=1..50&before=<id>`): `{ items, unreadCount, nextCursor }` ([ADR-07](docs/ADR-07-Notificaciones-y-preferencias.md)) |
+| `POST` | `/api/v1/notifications/{id}/read` | Marca una leída: `204`, `404` si no existe o es de otro |
+| `POST` | `/api/v1/notifications/read-all` | Marca todas leídas: `204` |
+| `GET` | `/api/v1/notifications/preferences` | Preferencias del usuario: `{ items }` |
+| `PUT` | `/api/v1/notifications/preferences/{server\|channel\|thread}/{scopeId}` | Crea o cambia una preferencia (`{ level?, muted?, mutedUntil?, serverId? }`); solo cambia lo que llega |
+| `DELETE` | `/api/v1/notifications/preferences/{server\|channel\|thread}/{scopeId}` | Vuelve al default: `204` |
 
 El contrato completo está en [`docs/openapi.yaml`](docs/openapi.yaml).
 
@@ -161,6 +170,31 @@ curl -si -H 'X-User-Role: user' -H 'X-User-Id: auth0|local' localhost:3000/api/v
 
 Un offset con `+` en la query va como `%2B` (sin codificar, `+` llega como espacio y es `400`).
 
+### Notificaciones
+
+Bandeja y preferencias del usuario (historia "Responder en un hilo", CA5). Todas las rutas necesitan
+`X-User-Id` (lo pone Kong; sin él, `401`) y cada usuario solo ve y cambia lo suyo.
+
+- **Qué genera avisos:** `chat.message.created` de Chat con `thread_participant_ids` (una respuesta en un
+  hilo). Se avisa a los participantes menos el autor, según sus preferencias. Una entrega repetida no duplica
+  (`UNIQUE (event_id, user_id)`).
+- **Preferencias:** por `server`, `channel` (también un DM, `dm-…`) o `thread`. `level` (`all`, `mentions`,
+  `none`, o `null` para heredar) y `muted`/`mutedUntil` van por separado: silenciar y reactivar no cambian el
+  nivel. Se aplica la más específica (hilo → canal → servidor → default: `mentions` en servidores, `all` en
+  DMs); un silencio vigente en cualquier nivel silencia todo lo de abajo. Una respuesta en un hilo tuyo pasa
+  con `mentions`.
+- **Entrega:** se guarda en `notifications` (la fuente de verdad) y se avisa en vivo con `NOTIFICATION_CREATED`
+  por el inbox de Chat (`/internal/inbox/events`, lotes de 10, sin reintento). Si Chat no responde, el aviso
+  igual queda en la bandeja.
+- **Retención:** al arrancar y cada 6 h se borran las leídas de más de 30 días y todas las de más de 90.
+  `channel.deleted` y `server.deleted` borran avisos y preferencias de ese canal o servidor.
+
+```bash
+curl -s -H 'X-User-Id: auth0|local' 'localhost:3000/api/v1/notifications?unread=true' | jq
+curl -s -X PUT -H 'X-User-Id: auth0|local' -H 'content-type: application/json' \
+  -d '{"muted":true}' localhost:3000/api/v1/notifications/preferences/thread/<id del mensaje raíz> | jq
+```
+
 ## Tests, lint y seguridad
 
 Los mismos comandos que corre el CI:
@@ -193,7 +227,8 @@ src/
 │   ├── status/   monitor en memoria, sondas HTTP, catálogo de servicios, estado combinado, vistas y rutas
 │   ├── incidents/ store en Postgres (con auditoría), caché de activos, vistas y rutas de staff
 │   ├── audit/     almacenamiento en Postgres, consumidor RabbitMQ, permisos y endpoint de auditoría de servidores
-│   └── metrics/   métricas globales: período, consulta a Chat y Server-Roles, caché de 60 s y ruta de staff
+│   ├── metrics/   métricas globales: período, consulta a Chat y Server-Roles, caché de 60 s y ruta de staff
+│   └── notifications/ reglas de preferencia (puras), consumer con DLQ, bandeja en Postgres, aviso por el inbox de Chat y rutas
 ├── utils/        db-check.ts (SELECT 1 con timeout) y problem.ts (respuestas application/problem+json)
 ├── plugins/      (vacío)
 tests/
@@ -218,3 +253,5 @@ tests/
 | [ADR-03](docs/ADR-03-Incidentes-y-migraciones.md) | Incidentes de la plataforma, migraciones y auditoría |
 | [ADR-04](docs/ADR-04-Registro-de-auditoria-de-servidores.md) | Registro de auditoría de moderación de servidores y consumo de eventos (HU 61) |
 | [ADR-05](docs/ADR-05-Metricas-globales.md) | Métricas globales del backoffice por consulta síncrona a Chat y Server-Roles |
+| [ADR-06](docs/ADR-06-Exportacion-de-metricas-a-CSV.md) | Exportación de métricas a CSV |
+| [ADR-07](docs/ADR-07-Notificaciones-y-preferencias.md) | Bandeja y preferencias de notificación, consumo de `chat.message.created` |
