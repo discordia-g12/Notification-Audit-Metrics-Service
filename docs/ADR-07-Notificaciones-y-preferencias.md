@@ -71,8 +71,9 @@ Restricciones:
 
 ## Consecuencias
 
-* Un aviso se puede perder entre Chat y RabbitMQ (Chat no tiene outbox, D3 del plan, en la deuda técnica);
-  una vez en la cola, no: lo que falla queda en la DLQ.
+* Entre Chat y RabbitMQ un aviso no se pierde: Chat lo guarda en el outbox de la propia respuesta y lo
+  reintenta hasta que RabbitMQ lo confirma (ADR-07 de Chat). Puede llegar repetido (reintentos, varias
+  instancias): `UNIQUE (event_id, user_id)` lo descarta. Una vez en la cola, lo que falla queda en la DLQ.
 * Si el aviso en vivo falla, el usuario lo ve al refrescar la bandeja (la web la consulta cada 60 s y al
   volver el foco).
 * La DLQ no se vacía sola: hay que revisarla desde el panel de RabbitMQ (`localhost:15672`) y reencolar a mano.
