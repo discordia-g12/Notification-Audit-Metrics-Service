@@ -1,6 +1,6 @@
 # Notification-Audit-Metrics-Service
 
-Servicio de notificaciones, auditoría y métricas de Discordia (Node.js 20, TypeScript, Fastify 4 y
+Servicio de notificaciones, auditoría y métricas de Discordia (Node.js 26, TypeScript, Fastify 5 y
 PostgreSQL).
 
 **Estado actual:** tiene el servidor, la conexión a PostgreSQL, los health checks, el pipeline de CI/CD, el
