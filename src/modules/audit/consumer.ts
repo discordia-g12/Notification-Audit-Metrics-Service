@@ -27,6 +27,16 @@ export interface AuditConsumerOptions {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 
+/**
+ * Cola de auditoría con DLQ (D5). RabbitMQ no deja agregarle argumentos a una cola existente, así que es una cola
+ * nueva; la anterior (`LEGACY_AUDIT_QUEUE`, sin DLQ) se retira sola al conectar (ver retireLegacyQueue).
+ */
+export const AUDIT_QUEUE = 'notification_audit_events.v2';
+export const LEGACY_AUDIT_QUEUE = 'notification_audit_events';
+/** Mensajes sin confirmar a la vez: acota la memoria (el contenedor tiene 96 MB de heap). */
+export const AUDIT_PREFETCH = 10;
+export const deadLetterQueueOf = (queue: string) => `${queue}.dlq`;
+
 export const AUDIT_ROUTING_KEYS = [
   'member.*',
   'role.*',
@@ -57,7 +67,7 @@ export class AuditConsumer {
   constructor(options: AuditConsumerOptions) {
     this.url = options.url || process.env.RABBITMQ_URL || 'amqp://admin:admin@rabbitmq:5672/';
     this.exchange = options.exchange || process.env.RABBITMQ_EXCHANGE || 'server.events';
-    this.queue = options.queue || process.env.RABBITMQ_QUEUE || 'notification_audit_events';
+    this.queue = options.queue || process.env.RABBITMQ_QUEUE || AUDIT_QUEUE;
     this.pool = options.pool;
     this.logger = options.logger || console;
     this.connectFn = options.connect;
@@ -135,16 +145,26 @@ export class AuditConsumer {
     try {
       const channel = await conn.createChannel();
       await channel.assertExchange(this.exchange, 'topic', { durable: true });
-      const q = await channel.assertQueue(this.queue, { durable: true });
+      const dlq = deadLetterQueueOf(this.queue);
+      await channel.assertQueue(dlq, { durable: true });
+      // Exchange por defecto ('') con la DLQ como routing key: lo que se rechaza va directo a esa cola
+      const q = await channel.assertQueue(this.queue, {
+        durable: true,
+        arguments: { 'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq },
+      });
 
       for (const routingKey of AUDIT_ROUTING_KEYS) {
         await channel.bindQueue(q.queue, this.exchange, routingKey);
       }
 
+      await channel.prefetch(AUDIT_PREFETCH);
       await channel.consume(q.queue, (msg: ConsumeMessage | null) => {
         if (!msg) return;
         this.handleMessage(msg, channel);
       });
+
+      // Recién con la cola nueva recibiendo: así ningún evento queda sin cola en el cambio
+      await this.retireLegacyQueue(conn, channel);
 
       this.connection = conn;
       this.channel = channel;
@@ -152,6 +172,39 @@ export class AuditConsumer {
       conn.removeAllListeners('close');
       await conn.close().catch(() => undefined);
       throw err;
+    }
+  }
+
+  /**
+   * La cola anterior (sin DLQ) deja de recibir: se le sacan los bindings. Si está vacía se borra; si no, se
+   * consume hasta vaciarla con el mismo handler y se borra en el próximo arranque. Se pregunta por otro canal:
+   * si la cola no existe, RabbitMQ cierra el canal que preguntó.
+   */
+  private async retireLegacyQueue(conn: ChannelModel, channel: Channel): Promise<void> {
+    if (this.queue === LEGACY_AUDIT_QUEUE) return;
+    const probe = await conn.createChannel();
+    probe.on('error', () => undefined);
+    try {
+      let messageCount: number;
+      try {
+        ({ messageCount } = await probe.checkQueue(LEGACY_AUDIT_QUEUE));
+      } catch {
+        return; // ya no existe
+      }
+      for (const routingKey of AUDIT_ROUTING_KEYS) {
+        await probe.unbindQueue(LEGACY_AUDIT_QUEUE, this.exchange, routingKey);
+      }
+      if (messageCount === 0) {
+        await probe.deleteQueue(LEGACY_AUDIT_QUEUE);
+        this.logger.info({ queue: LEGACY_AUDIT_QUEUE }, 'AuditConsumer: legacy queue deleted');
+        return;
+      }
+      this.logger.warn({ queue: LEGACY_AUDIT_QUEUE, messageCount }, 'AuditConsumer: draining legacy queue');
+      await channel.consume(LEGACY_AUDIT_QUEUE, (msg: ConsumeMessage | null) => {
+        if (msg) this.handleMessage(msg, channel);
+      });
+    } finally {
+      await probe.close().catch(() => undefined);
     }
   }
 
@@ -167,7 +220,8 @@ export class AuditConsumer {
       }
       channel.ack(msg);
     } catch (err) {
-      this.logger.error({ err, routingKey }, 'Failed to process audit event');
+      // Sin reencolar (no entra en loop): va a la DLQ para revisarlo. Los de la cola anterior se descartan
+      this.logger.error({ err, routingKey }, 'Failed to process audit event, sent to DLQ');
       channel.nack(msg, false, false);
     }
   }

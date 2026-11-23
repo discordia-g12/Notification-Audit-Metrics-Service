@@ -59,6 +59,7 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 | `STATUS_POLL_INTERVAL_MS` | `15000` | Cada cuánto se sondea (1000 a 3600000) |
 | `STATUS_PROBE_TIMEOUT_MS` | `2000` | Timeout de cada sonda (100 a 60000, menor que el intervalo) |
 | `RABBITMQ_URL` | `amqp://admin:admin@rabbitmq:5672/` | Conexión al broker RabbitMQ para consumir eventos de auditoría |
+| `RABBITMQ_QUEUE` | `notification_audit_events.v2` | Cola de auditoría, con DLQ `<cola>.dlq` y prefetch 10. No usar `notification_audit_events` (la anterior, sin DLQ): RabbitMQ rechaza declararla con otros argumentos. El consumidor la retira solo (ADR-04) |
 | `SERVER_ROLES_URL` | `http://localhost:8000` | URL interna de Server-Roles-Core para validación de permisos de moderador |
 | `CHAT_ENGINE_URL` | `http://localhost:3000` | Base de Chat-Engine para las métricas (`/internal/metrics/messages`). En prod, mismo nodo realtime |
 | `CORE_SERVICE_URL` | `http://localhost:8002` | Base de Server-Roles-Core para las métricas (`/internal/metrics/servers`). En prod, `http://<EDGE_HOST>:8002` |
