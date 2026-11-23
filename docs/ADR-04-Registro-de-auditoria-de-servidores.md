@@ -40,7 +40,12 @@ Las acciones a auditar abarcan:
 
 ### 2. Ingesta asíncrona mediante RabbitMQ (`AuditConsumer`)
 
-- Consumidor asíncrono con cola durable `notification_audit_events` ligada al exchange `server.events` de RabbitMQ.
+- Consumidor asíncrono con cola durable `notification_audit_events.v2` ligada al exchange `server.events` de RabbitMQ,
+  con `prefetch(10)` y DLQ (`notification_audit_events.v2.dlq`): un evento que no se puede procesar (JSON roto,
+  error de base) se rechaza sin reencolar y queda en la DLQ para revisarlo, en vez de perderse.
+- *Cambio posterior (D5):* la cola original `notification_audit_events` no tenía DLQ, y RabbitMQ no deja agregarle
+  argumentos a una cola existente. Al conectar, el consumidor declara la nueva, le saca los bindings a la vieja y
+  la borra si está vacía; si tiene mensajes, los consume hasta vaciarla y la borra en el próximo arranque.
 - Escucha 22 claves de enrutamiento (`member.*`, `channel.*`, `category.*`, `role.*`, `server.*`, `invite.*`, `message.deleted_by_moderator`).
 - Desacoplamiento total: los servicios emisores (`Server-Roles-Core-Service` y `Chat-Engine-Service`) escriben en su outbox transaccional y continúan sin esperar la auditoría.
 - Si RabbitMQ no está disponible al iniciar o se interrumpe la conexión, el consumidor reintenta automáticamente con backoff exponencial sin frenar el arranque del servicio.
