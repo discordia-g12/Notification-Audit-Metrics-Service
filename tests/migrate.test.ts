@@ -43,7 +43,13 @@ test('runMigrations: aplica las del servicio una sola vez', async () => {
   const logger = memoryLogger();
   const first = await runMigrations(db.pool, MIGRATIONS, logger);
   assert.deepStrictEqual(first, MIGRATIONS.map((m) => m.id));
-  assert.deepStrictEqual(await tables(), ['audit_logs', 'incidents', 'schema_migrations']);
+  assert.deepStrictEqual(await tables(), [
+    'audit_logs',
+    'incidents',
+    'notification_preferences',
+    'notifications',
+    'schema_migrations',
+  ]);
   assert.strictEqual(logger.lines.filter((l) => l.msg === 'migración aplicada').length, MIGRATIONS.length);
 
   const second = await runMigrations(db.pool, MIGRATIONS);

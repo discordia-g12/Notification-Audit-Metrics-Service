@@ -27,6 +27,13 @@ import {
   AuditConsumer,
   type checkServerModeratorAccess,
 } from './modules/audit';
+import {
+  InboxPublisher,
+  NotificationConsumer,
+  notificationRoutes,
+  purgeOldNotifications,
+  RETENTION_INTERVAL_MS,
+} from './modules/notifications';
 import { createDatabaseCheck } from './utils/db-check';
 
 const READYZ_TIMEOUT_MS = 2000;
@@ -48,6 +55,12 @@ export interface BuildAppOptions {
   disableAuditConsumer?: boolean;
   /** Reemplaza el AuditConsumer (tests). */
   auditConsumer?: { start(): void; stop(): Promise<void> };
+  /** Deshabilita el consumidor de chat.message.created (tests). */
+  disableNotificationConsumer?: boolean;
+  /** Reemplaza el NotificationConsumer (tests). */
+  notificationConsumer?: { start(): void; stop(): Promise<void> };
+  /** Reemplaza el fetch del aviso en vivo por el inbox de Chat (tests). */
+  inboxFetch?: (input: string, init: RequestInit) => Promise<Response>;
   /** Reemplaza el check de permisos de moderación (tests). */
   checkModeratorAccess?: typeof checkServerModeratorAccess;
   /** Reemplaza el fetch de las consultas de métricas a Chat y Server-Roles (tests). */
@@ -152,6 +165,38 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           logger: app.log.child({ module: 'audit' }),
         }));
 
+  app.register(notificationRoutes, { pool });
+
+  const inbox = new InboxPublisher({
+    chatEngineUrl: metricsConfig.chatEngineUrl,
+    internalToken: env.INTERNAL_API_TOKEN,
+    fetchFn: options.inboxFetch,
+  });
+  const notificationLog = app.log.child({ module: 'notifications' });
+  const notificationConsumer =
+    options.notificationConsumer ??
+    (options.disableNotificationConsumer
+      ? null
+      : new NotificationConsumer({
+          pool,
+          url: env.RABBITMQ_URL,
+          exchange: env.RABBITMQ_EXCHANGE,
+          queue: env.RABBITMQ_MESSAGE_QUEUE,
+          logger: notificationLog,
+          deliver: (created) => {
+            void inbox.publish(created).then((failed) => {
+              if (failed > 0) notificationLog.warn({ failed }, 'notifications: no se pudo avisar por el inbox de Chat');
+            });
+          },
+        }));
+
+  // Retención de la bandeja: al arrancar y cada 6 h. Si falla, se reintenta en la próxima vuelta.
+  const purge = () =>
+    purgeOldNotifications(pool)
+      .then((deleted) => deleted > 0 && notificationLog.info({ deleted }, 'notifications: avisos viejos borrados'))
+      .catch((err) => notificationLog.warn({ err }, 'notifications: no se pudieron borrar los avisos viejos'));
+  let purgeTimer: NodeJS.Timeout | null = null;
+
   // Primera ronda al quedar lista la app, sin esperarla: no demora el listen.
   app.addHook('onReady', async () => {
     try {
@@ -161,9 +206,17 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     }
     statusMonitor.start();
     auditConsumer?.start();
+    notificationConsumer?.start();
+    if (notificationConsumer) {
+      void purge();
+      purgeTimer = setInterval(() => void purge(), RETENTION_INTERVAL_MS);
+      purgeTimer.unref();
+    }
   });
 
   app.addHook('onClose', async () => {
+    if (purgeTimer) clearInterval(purgeTimer);
+    await notificationConsumer?.stop();
     await auditConsumer?.stop();
     await statusMonitor.stop();
     await pool.end();

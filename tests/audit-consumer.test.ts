@@ -2,12 +2,25 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Channel, ChannelModel, ConsumeMessage } from 'amqplib';
 import type { Pool } from 'pg';
-import { AuditConsumer, AUDIT_ROUTING_KEYS } from '../src/modules/audit/consumer';
+import {
+  AuditConsumer,
+  AUDIT_PREFETCH,
+  AUDIT_QUEUE,
+  AUDIT_ROUTING_KEYS,
+  LEGACY_AUDIT_QUEUE,
+} from '../src/modules/audit/consumer';
 
 class FakeChannel {
   exchanges: string[] = [];
   queues: string[] = [];
+  queueArgs = new Map<string, Record<string, unknown> | undefined>();
   bindings: [string, string, string][] = [];
+  unbound: [string, string, string][] = [];
+  deleted: string[] = [];
+  consumed: string[] = [];
+  prefetchCount = 0;
+  /** Mensajes en la cola anterior; null: no existe. */
+  legacyMessages: number | null = null;
   consumerCb: ((msg: ConsumeMessage | null) => void) | null = null;
   acked: ConsumeMessage[] = [];
   nacked: ConsumeMessage[] = [];
@@ -17,9 +30,31 @@ class FakeChannel {
     return { exchange };
   }
 
-  async assertQueue(queue: string) {
+  async assertQueue(queue: string, options?: { arguments?: Record<string, unknown> }) {
     this.queues.push(queue);
+    this.queueArgs.set(queue, options?.arguments);
     return { queue, messageCount: 0, consumerCount: 0 };
+  }
+
+  async checkQueue(queue: string) {
+    if (this.legacyMessages === null) throw new Error('NOT_FOUND');
+    return { queue, messageCount: this.legacyMessages, consumerCount: 0 };
+  }
+
+  async unbindQueue(queue: string, source: string, pattern: string) {
+    this.unbound.push([queue, source, pattern]);
+  }
+
+  async deleteQueue(queue: string) {
+    this.deleted.push(queue);
+  }
+
+  async prefetch(count: number) {
+    this.prefetchCount = count;
+  }
+
+  on() {
+    return this;
   }
 
   async bindQueue(queue: string, source: string, pattern: string) {
@@ -27,6 +62,7 @@ class FakeChannel {
   }
 
   async consume(queue: string, onMessage: (msg: ConsumeMessage | null) => void) {
+    this.consumed.push(queue);
     this.consumerCb = onMessage;
     return { consumerTag: 'tag-1' };
   }
@@ -101,7 +137,13 @@ describe('Audit Consumer', () => {
 
     // Verificar bindings
     assert.strictEqual(fakeConn.channel.exchanges[0], 'server.events');
-    assert.strictEqual(fakeConn.channel.queues[0], 'notification_audit_events');
+    // D5: la cola nueva con DLQ y prefetch
+    assert.deepStrictEqual(fakeConn.channel.queues, [`${AUDIT_QUEUE}.dlq`, AUDIT_QUEUE]);
+    assert.deepStrictEqual(fakeConn.channel.queueArgs.get(AUDIT_QUEUE), {
+      'x-dead-letter-exchange': '',
+      'x-dead-letter-routing-key': `${AUDIT_QUEUE}.dlq`,
+    });
+    assert.strictEqual(fakeConn.channel.prefetchCount, AUDIT_PREFETCH);
     assert.strictEqual(fakeConn.channel.bindings.length, AUDIT_ROUTING_KEYS.length);
 
     // Enviar mensaje de prueba válido
@@ -195,5 +237,48 @@ describe('Audit Consumer', () => {
     assert.ok(connectCalls >= 2);
 
     await consumer.stop();
+  });
+
+  describe('retiro de la cola anterior (sin DLQ)', () => {
+    async function connectWith(legacyMessages: number | null, queue?: string) {
+      const fakeConn = new FakeConnection();
+      fakeConn.channel.legacyMessages = legacyMessages;
+      const consumer = new AuditConsumer({
+        pool: {} as unknown as Pool,
+        queue,
+        connect: async () => fakeConn as unknown as ChannelModel,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      });
+      consumer.start();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await consumer.stop();
+      return fakeConn.channel;
+    }
+
+    it('vacía: le saca los bindings y la borra', async () => {
+      const channel = await connectWith(0);
+      assert.strictEqual(channel.unbound.length, AUDIT_ROUTING_KEYS.length);
+      assert.ok(channel.unbound.every(([queue]) => queue === LEGACY_AUDIT_QUEUE));
+      assert.deepStrictEqual(channel.deleted, [LEGACY_AUDIT_QUEUE]);
+    });
+
+    it('con mensajes: deja de recibir y se consume hasta vaciarla, sin borrarla todavía', async () => {
+      const channel = await connectWith(3);
+      assert.strictEqual(channel.unbound.length, AUDIT_ROUTING_KEYS.length);
+      assert.deepStrictEqual(channel.deleted, []);
+      assert.deepStrictEqual(channel.consumed, [AUDIT_QUEUE, LEGACY_AUDIT_QUEUE]);
+    });
+
+    it('si ya no existe, no hace nada', async () => {
+      const channel = await connectWith(null);
+      assert.deepStrictEqual(channel.unbound, []);
+      assert.deepStrictEqual(channel.deleted, []);
+    });
+
+    it('si la cola configurada es la anterior (RABBITMQ_QUEUE viejo), no la toca', async () => {
+      const channel = await connectWith(0, LEGACY_AUDIT_QUEUE);
+      assert.deepStrictEqual(channel.deleted, []);
+      assert.deepStrictEqual(channel.unbound, []);
+    });
   });
 });
