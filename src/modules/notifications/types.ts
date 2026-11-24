@@ -1,5 +1,8 @@
-/** Por qué se le avisa a alguien. Solo `thread_reply` se genera hoy; los otros son de la épica. */
-export const REASONS = ['thread_reply', 'mention', 'dm'] as const;
+/**
+ * Por qué se le avisa a alguien. Si cae en varios, gana el primero de esta lista (uno por usuario).
+ * `message`: un mensaje cualquiera de un canal o servidor donde pidió el nivel `all`.
+ */
+export const REASONS = ['mention', 'dm', 'thread_reply', 'message'] as const;
 export type Reason = (typeof REASONS)[number];
 
 export const LEVELS = ['all', 'mentions', 'none'] as const;
@@ -18,6 +21,10 @@ export interface MessageCreatedEvent {
   authorId: string;
   threadParticipantIds: string[];
   mentionUserIds: string[];
+  mentionRoleIds: string[];
+  mentionEveryone: boolean;
+  /** Participantes del DM menos el autor. Solo en DMs; los eventos viejos no lo traen. */
+  recipientIds: string[];
   isDm: boolean;
   preview: string;
   createdAt: Date;

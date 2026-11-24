@@ -10,6 +10,15 @@ import {
   upsertPreference,
   type PreferenceChange,
 } from './repository';
+import {
+  deleteDevice,
+  getPushEnabled,
+  setPushEnabled,
+  upsertDevice,
+  PUSH_PLATFORMS,
+  type PushPlatform,
+  type WebPushKeys,
+} from './push-repository';
 import { LEVELS, SCOPE_TYPES, type Level, type Notification, type Preference, type ScopeType } from './types';
 
 export const DEFAULT_PAGE = 20;
@@ -59,6 +68,67 @@ const putPreferenceSchema = {
     },
   },
 } as const;
+
+// Expo push token (`ExponentPushToken[…]`, o `ExpoPushToken[…]` en versiones nuevas)
+const EXPO_TOKEN = '^Expo(nent)?PushToken\\[[A-Za-z0-9_-]{1,200}\\]$';
+// Solo los servicios de push de los navegadores: el endpoint lo elige el cliente y este servicio le hace un
+// POST, así que cualquier otro host sería un SSRF desde el nodo realtime.
+const WEB_PUSH_ENDPOINT =
+  '^https://([a-z0-9-]+\\.)*(fcm\\.googleapis\\.com|push\\.services\\.mozilla\\.com|notify\\.windows\\.com|push\\.apple\\.com)/[!-~]+$';
+const BASE64URL = '^[A-Za-z0-9_-]+=*$';
+
+const registerDeviceSchema = {
+  body: {
+    type: 'object',
+    required: ['platform'],
+    additionalProperties: false,
+    properties: {
+      platform: { type: 'string', enum: [...PUSH_PLATFORMS] },
+      token: { type: 'string', maxLength: 255, pattern: EXPO_TOKEN },
+      subscription: {
+        type: 'object',
+        required: ['endpoint', 'keys'],
+        additionalProperties: false,
+        properties: {
+          endpoint: { type: 'string', maxLength: 1024, pattern: WEB_PUSH_ENDPOINT },
+          keys: {
+            type: 'object',
+            required: ['p256dh', 'auth'],
+            additionalProperties: false,
+            properties: {
+              p256dh: { type: 'string', maxLength: 200, pattern: BASE64URL },
+              auth: { type: 'string', maxLength: 100, pattern: BASE64URL },
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+const deleteDeviceSchema = {
+  body: {
+    type: 'object',
+    required: ['token'],
+    additionalProperties: false,
+    properties: { token: { type: 'string', minLength: 1, maxLength: 1024 } },
+  },
+} as const;
+
+const pushSettingsSchema = {
+  body: {
+    type: 'object',
+    required: ['pushEnabled'],
+    additionalProperties: false,
+    properties: { pushEnabled: { type: 'boolean' } },
+  },
+} as const;
+
+interface RegisterDeviceBody {
+  platform: PushPlatform;
+  token?: string;
+  subscription?: { endpoint: string; keys: WebPushKeys };
+}
 
 interface ScopeParams {
   scopeType: ScopeType;
@@ -111,7 +181,10 @@ async function requireUser(request: FastifyRequest, reply: FastifyReply) {
  * sacar el prefijo y exige token. Cada usuario solo ve y cambia lo suyo: el id sale de X-User-Id, nunca
  * del cliente.
  */
-export async function notificationRoutes(app: FastifyInstance, options: { pool: Pool }): Promise<void> {
+export async function notificationRoutes(
+  app: FastifyInstance,
+  options: { pool: Pool; vapidPublicKey?: string | null },
+): Promise<void> {
   const { pool } = options;
 
   app.addHook('onRequest', async (_request, reply) => {
@@ -193,4 +266,51 @@ export async function notificationRoutes(app: FastifyInstance, options: { pool: 
       return reply.code(204).send();
     },
   );
+
+  // Push (ADR-08). Rutas estáticas: no chocan con /:id/read (find-my-way prioriza lo estático).
+  app.post<{ Body: RegisterDeviceBody }>(
+    `${BASE}/push/devices`,
+    { schema: registerDeviceSchema },
+    async (request, reply) => {
+      const { platform, token, subscription } = request.body;
+      const web = platform === 'web';
+      if (web ? !subscription || token !== undefined : !token || subscription !== undefined) {
+        return sendProblem(request, reply, 400, 'La solicitud tiene campos inválidos', {
+          errors: [{ field: web ? 'subscription' : 'token', message: web ? 'web lleva subscription' : 'ios y android llevan token' }],
+        });
+      }
+      await upsertDevice(pool, {
+        userId: userOf(request) as string,
+        platform,
+        token: web ? subscription!.endpoint : token!,
+        keys: web ? subscription!.keys : null,
+      });
+      return reply.code(204).send();
+    },
+  );
+
+  app.delete<{ Body: { token: string } }>(
+    `${BASE}/push/devices`,
+    { schema: deleteDeviceSchema },
+    async (request, reply) => {
+      await deleteDevice(pool, userOf(request) as string, request.body.token);
+      return reply.code(204).send();
+    },
+  );
+
+  app.get(`${BASE}/push/settings`, async (request) => ({
+    pushEnabled: await getPushEnabled(pool, userOf(request) as string),
+  }));
+
+  app.put<{ Body: { pushEnabled: boolean } }>(
+    `${BASE}/push/settings`,
+    { schema: pushSettingsSchema },
+    async (request) => {
+      await setPushEnabled(pool, userOf(request) as string, request.body.pushEnabled);
+      return { pushEnabled: request.body.pushEnabled };
+    },
+  );
+
+  // Para que la web se suscriba sin tener la clave en el build. null: push web apagado en este entorno.
+  app.get(`${BASE}/push/vapid-public-key`, async () => ({ publicKey: options.vapidPublicKey ?? null }));
 }

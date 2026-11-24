@@ -5,6 +5,7 @@ import {
   deleteForChannel,
   deleteForServer,
   deletePreference,
+  findAllLevelUserIds,
   findPreferencesFor,
   insertNotifications,
   listNotifications,
@@ -202,6 +203,16 @@ describe('preferencias', () => {
     assert.strictEqual(pref.serverId, 'srv');
   });
 
+  it('findAllLevelUserIds: quienes pidieron all en el canal o el servidor, una vez cada uno', async () => {
+    await upsertPreference(db.pool, 'alice', 'server', 'srv', { level: 'all' });
+    await upsertPreference(db.pool, 'alice', 'channel', 'chan', { level: 'all', serverId: 'srv' });
+    await upsertPreference(db.pool, 'carol', 'channel', 'chan', { level: 'mentions', serverId: 'srv' });
+    await upsertPreference(db.pool, 'dave', 'thread', 'chan', { level: 'all', serverId: 'srv' });
+    await upsertPreference(db.pool, 'erin', 'server', 'otro', { level: 'all' });
+
+    assert.deepStrictEqual(await findAllLevelUserIds(db.pool, 'srv', 'chan'), ['alice']);
+  });
+
   it('findPreferencesFor trae solo las de ese hilo, canal y servidor, de esos usuarios', async () => {
     await upsertPreference(db.pool, 'alice', 'thread', 'thr', { muted: true });
     await upsertPreference(db.pool, 'alice', 'server', 'srv', { level: 'none' });
@@ -266,13 +277,41 @@ describe('limpieza y retención', () => {
 });
 
 describe('processMessageCreated (CA5)', () => {
-  const run = async (e: MessageCreatedEvent) => {
+  const run = async (
+    e: MessageCreatedEvent,
+    members: string[] | Error = [],
+    roles: Record<string, string[] | Error> = {},
+    viewers: string[] | Error | null = null, // null: todos ven el canal
+  ) => {
     const delivered: Notification[][] = [];
+    const memberCalls: string[] = [];
+    const roleCalls: string[] = [];
+    const viewerCalls: string[][] = [];
     const created = await processMessageCreated(
-      { pool: db.pool, deliver: (n) => delivered.push(n), now: () => new Date('2026-11-23T12:00:00Z') },
+      {
+        pool: db.pool,
+        deliver: (n) => delivered.push(n),
+        memberIds: async (serverId) => {
+          memberCalls.push(serverId);
+          if (members instanceof Error) throw members;
+          return members;
+        },
+        roleMemberIds: async (serverId, roleId) => {
+          roleCalls.push(`${serverId}/${roleId}`);
+          const ids = new Map(Object.entries(roles)).get(roleId) ?? [];
+          if (ids instanceof Error) throw ids;
+          return ids;
+        },
+        channelViewerIds: async (_channelId, ids) => {
+          viewerCalls.push(ids);
+          if (viewers instanceof Error) throw viewers;
+          return viewers === null ? ids : ids.filter((id) => viewers.includes(id));
+        },
+        now: () => new Date('2026-11-23T12:00:00Z'),
+      },
       e,
     );
-    return { created, delivered };
+    return { created, delivered, memberCalls, roleCalls, viewerCalls };
   };
 
   it('avisa a los participantes del hilo con el default, sin preferencias', async () => {
@@ -303,6 +342,129 @@ describe('processMessageCreated (CA5)', () => {
 
   it('sin candidatos no toca la base', async () => {
     const { created } = await run(event({ threadParticipantIds: ['bob'] }));
+    assert.deepStrictEqual(created, []);
+  });
+
+  it('DM: avisa a recipient_ids como dm, sin buscar nivel all ni llamar a Server-Roles', async () => {
+    const dm = event({ serverId: null, channelId: 'dm-1', threadId: null, isDm: true, threadParticipantIds: [] });
+    const { created, memberCalls } = await run({ ...dm, recipientIds: ['alice'] });
+    assert.deepStrictEqual(
+      created.map((n) => [n.userId, n.reason]),
+      [['alice', 'dm']],
+    );
+    assert.deepStrictEqual(memberCalls, []);
+  });
+
+  it('canal privado: la mención directa solo avisa a quien ve el canal', async () => {
+    const e = event({ threadId: null, threadParticipantIds: [], mentionUserIds: ['alice', 'zoe'] });
+    const { created, viewerCalls } = await run(e, [], {}, ['alice']);
+    assert.deepStrictEqual(created.map((n) => n.userId), ['alice']);
+    assert.strictEqual(viewerCalls.length, 1);
+    assert.deepStrictEqual((await run(e, [], {}, [])).created, []);
+  });
+
+  it('canal privado: @everyone solo avisa a los viewers (una llamada por evento)', async () => {
+    const e = event({ threadId: null, threadParticipantIds: [], mentionEveryone: true });
+    const { created, viewerCalls } = await run(e, ['alice', 'zoe', 'yan'], {}, ['zoe']);
+    assert.deepStrictEqual(created.map((n) => n.userId), ['zoe']);
+    assert.strictEqual(viewerCalls.length, 1);
+  });
+
+  it('DM: no pasa por el filtro de visibilidad', async () => {
+    const dm = event({ serverId: null, channelId: 'dm-1', threadId: null, isDm: true, threadParticipantIds: [] });
+    const { created, viewerCalls } = await run({ ...dm, recipientIds: ['alice'] }, [], {}, []);
+    assert.strictEqual(created.length, 1);
+    assert.deepStrictEqual(viewerCalls, []);
+  });
+
+  it('Server-Roles caído al filtrar viewers → lanza (DLQ) y no guarda nada', async () => {
+    await assert.rejects(run(event(), [], {}, new Error('timeout')), /timeout/);
+    const { rows } = await db.pool.query('SELECT 1 FROM notifications');
+    assert.strictEqual(rows.length, 0);
+  });
+
+  it('mención directa como mention, aunque también participe del hilo', async () => {
+    const { created } = await run(event({ mentionUserIds: ['alice'] }));
+    const byUser = Object.fromEntries(created.map((n) => [n.userId, n.reason]));
+    assert.deepStrictEqual(byUser, { alice: 'mention', carol: 'thread_reply' });
+  });
+
+  it('@everyone: los miembros (menos el autor) como mention', async () => {
+    const { created, memberCalls } = await run(event({ threadId: null, threadParticipantIds: [], mentionEveryone: true }), [
+      'bob',
+      'alice',
+      'zoe',
+    ]);
+    assert.deepStrictEqual(memberCalls, ['srv']);
+    assert.deepStrictEqual(created.map((n) => [n.userId, n.reason]).sort(), [
+      ['alice', 'mention'],
+      ['zoe', 'mention'],
+    ]);
+  });
+
+  it('Server-Roles caído con @everyone → lanza (DLQ) y no guarda nada', async () => {
+    const e = event({ mentionEveryone: true });
+    await assert.rejects(run(e, new Error('timeout')), /timeout/);
+    const { rows } = await db.pool.query('SELECT 1 FROM notifications');
+    assert.strictEqual(rows.length, 0);
+  });
+
+  it('mención de rol: avisa a sus miembros como mention, sin pedir member-ids', async () => {
+    const e = event({ threadId: null, threadParticipantIds: [], mentionRoleIds: ['mods', 'devs'] });
+    const { created, memberCalls, roleCalls } = await run(e, [], { mods: ['alice', 'bob'], devs: ['alice', 'zoe'] });
+    assert.deepStrictEqual(roleCalls.sort(), ['srv/devs', 'srv/mods']);
+    assert.deepStrictEqual(memberCalls, []);
+    assert.deepStrictEqual(created.map((n) => [n.userId, n.reason]).sort(), [
+      ['alice', 'mention'],
+      ['zoe', 'mention'],
+    ]);
+  });
+
+  it('rol 404 (de otro servidor o borrado) → nadie; con @everyone no pide los roles', async () => {
+    const noThread = { threadId: null, threadParticipantIds: [] };
+    assert.deepStrictEqual((await run(event({ ...noThread, mentionRoleIds: ['otro'] }))).created, []);
+
+    const { roleCalls } = await run(event({ ...noThread, mentionRoleIds: ['mods'], mentionEveryone: true }), ['alice']);
+    assert.deepStrictEqual(roleCalls, []);
+  });
+
+  it('rol y nivel all: los del rol se cruzan con los miembros ya pedidos', async () => {
+    await upsertPreference(db.pool, 'zoe', 'server', 'srv', { level: 'all' });
+    const e = event({ threadId: null, threadParticipantIds: [], mentionRoleIds: ['mods'] });
+    const { created } = await run(e, ['zoe', 'alice'], { mods: ['alice', 'ex'] });
+    assert.deepStrictEqual(created.map((n) => [n.userId, n.reason]).sort(), [
+      ['alice', 'mention'],
+      ['zoe', 'message'],
+    ]);
+  });
+
+  it('Server-Roles caído al pedir un rol → lanza (DLQ) y no guarda nada', async () => {
+    const e = event({ mentionRoleIds: ['mods'] });
+    await assert.rejects(run(e, [], { mods: new Error('timeout') }), /timeout/);
+    const { rows } = await db.pool.query('SELECT 1 FROM notifications');
+    assert.strictEqual(rows.length, 0);
+  });
+
+  it('nivel all: avisa como message a los miembros que lo pidieron en el canal o el servidor', async () => {
+    await upsertPreference(db.pool, 'zoe', 'server', 'srv', { level: 'all' });
+    await upsertPreference(db.pool, 'yan', 'channel', 'chan', { level: 'all', serverId: 'srv' });
+    await upsertPreference(db.pool, 'ex', 'server', 'srv', { level: 'all' });
+    await upsertPreference(db.pool, 'otro', 'channel', 'otro-canal', { level: 'all', serverId: 'srv' });
+
+    const { created } = await run(event({ threadId: null, threadParticipantIds: [] }), ['zoe', 'yan', 'otro']);
+    assert.deepStrictEqual(created.map((n) => [n.userId, n.reason]).sort(), [
+      ['yan', 'message'],
+      ['zoe', 'message'],
+    ], 'ex ya no es miembro; otro pidió all en otro canal');
+  });
+
+  it('CA2 con nivel all: el canal en mentions o silenciado pisa al servidor en all', async () => {
+    await upsertPreference(db.pool, 'zoe', 'server', 'srv', { level: 'all' });
+    await upsertPreference(db.pool, 'zoe', 'channel', 'chan', { level: 'mentions', serverId: 'srv' });
+    await upsertPreference(db.pool, 'yan', 'server', 'srv', { level: 'all' });
+    await upsertPreference(db.pool, 'yan', 'channel', 'chan', { muted: true, serverId: 'srv' });
+
+    const { created } = await run(event({ threadId: null, threadParticipantIds: [] }), ['zoe', 'yan']);
     assert.deepStrictEqual(created, []);
   });
 

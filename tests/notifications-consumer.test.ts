@@ -80,11 +80,18 @@ function fakePool(rows: (sql: string) => unknown[] = () => [], fail = false) {
   return { pool, queries };
 }
 
-async function connected(pool: Pool) {
+async function connected(
+  pool: Pool,
+  memberIds: (serverId: string) => Promise<string[]> = async () => [],
+  roleMemberIds: (serverId: string, roleId: string) => Promise<string[]> = async () => [],
+) {
   const conn = new FakeConnection();
   const consumer = new NotificationConsumer({
     pool,
     deliver: () => {},
+    memberIds,
+    roleMemberIds,
+    channelViewerIds: async (_c, ids) => ids,
     logger: silent,
     queue: 'q',
     connect: async () => conn as unknown as ChannelModel,
@@ -133,6 +140,54 @@ describe('NotificationConsumer', () => {
     await consumer.stop();
   });
 
+  it('camino común (canal sin menciones ni hilo, nadie con all): una sola consulta y sin Server-Roles', async () => {
+    const { pool, queries } = fakePool();
+    let memberCalls = 0;
+    const count = async () => {
+      memberCalls += 1;
+      return [];
+    };
+    const { consumer, channel } = await connected(pool, count, count);
+    const msg = message('chat.message.created', {
+      event_id: 'e1',
+      server_id: 'srv',
+      channel_id: 'chan',
+      thread_id: null,
+      message_id: 'm1',
+      author_id: 'bob',
+      mention_user_ids: [],
+      mention_role_ids: [],
+      mention_everyone: false,
+    });
+
+    await consumer.handleMessage(msg, channel as unknown as Channel);
+
+    assert.deepStrictEqual(channel.acked, [msg]);
+    assert.strictEqual(queries.length, 1);
+    assert.ok(queries[0].sql.includes("level = 'all'"));
+    assert.strictEqual(memberCalls, 0);
+    await consumer.stop();
+  });
+
+  it('Server-Roles caído con @everyone → nack sin reencolar (DLQ)', async () => {
+    const { consumer, channel } = await connected(fakePool().pool, async () => {
+      throw new Error('timeout');
+    });
+    const msg = message('chat.message.created', {
+      event_id: 'e1',
+      server_id: 'srv',
+      channel_id: 'chan',
+      message_id: 'm1',
+      author_id: 'bob',
+      mention_everyone: true,
+    });
+
+    await consumer.handleMessage(msg, channel as unknown as Channel);
+
+    assert.deepStrictEqual(channel.nacked, [msg]);
+    await consumer.stop();
+  });
+
   it('JSON inválido, payload incompleto o error de base → nack sin reencolar (DLQ)', async () => {
     const { consumer, channel } = await connected(fakePool().pool);
     const bad = [message('chat.message.created', '{no es json'), message('chat.message.created', { channel_id: 'c' })];
@@ -169,6 +224,9 @@ describe('NotificationConsumer', () => {
     const consumer = new NotificationConsumer({
       pool: fakePool().pool,
       deliver: () => {},
+      memberIds: async () => [],
+      roleMemberIds: async () => [],
+      channelViewerIds: async (_c, ids) => ids,
       logger: silent,
       baseDelayMs: 1,
       maxDelayMs: 2,

@@ -30,6 +30,11 @@ import {
 import {
   InboxPublisher,
   NotificationConsumer,
+  PushSender,
+  vapidFromEnv,
+  serverMemberIds,
+  roleMemberIds,
+  channelViewerIds,
   notificationRoutes,
   purgeOldNotifications,
   RETENTION_INTERVAL_MS,
@@ -61,6 +66,8 @@ export interface BuildAppOptions {
   notificationConsumer?: { start(): void; stop(): Promise<void> };
   /** Reemplaza el fetch del aviso en vivo por el inbox de Chat (tests). */
   inboxFetch?: (input: string, init: RequestInit) => Promise<Response>;
+  /** Reemplaza el fetch a la Expo Push API (tests). */
+  pushFetch?: (input: string, init: RequestInit) => Promise<Response>;
   /** Reemplaza el check de permisos de moderación (tests). */
   checkModeratorAccess?: typeof checkServerModeratorAccess;
   /** Reemplaza el fetch de las consultas de métricas a Chat y Server-Roles (tests). */
@@ -165,7 +172,8 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           logger: app.log.child({ module: 'audit' }),
         }));
 
-  app.register(notificationRoutes, { pool });
+  const vapid = vapidFromEnv(env);
+  app.register(notificationRoutes, { pool, vapidPublicKey: vapid?.publicKey });
 
   const inbox = new InboxPublisher({
     chatEngineUrl: metricsConfig.chatEngineUrl,
@@ -173,6 +181,14 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     fetchFn: options.inboxFetch,
   });
   const notificationLog = app.log.child({ module: 'notifications' });
+  const push = new PushSender({
+    pool,
+    expoAccessToken: env.EXPO_ACCESS_TOKEN,
+    vapid,
+    fetchFn: options.pushFetch,
+  });
+  if (vapid && !push.webEnabled) notificationLog.warn('notifications: VAPID inválido, push web apagado');
+  const serverRolesUrl = env.SERVER_ROLES_URL || 'http://server-roles-service:8080';
   const notificationConsumer =
     options.notificationConsumer ??
     (options.disableNotificationConsumer
@@ -183,9 +199,16 @@ function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           exchange: env.RABBITMQ_EXCHANGE,
           queue: env.RABBITMQ_MESSAGE_QUEUE,
           logger: notificationLog,
+          memberIds: serverMemberIds({ serverRolesUrl }),
+          roleMemberIds: roleMemberIds({ serverRolesUrl }),
+          channelViewerIds: channelViewerIds({ serverRolesUrl }),
+          // Después de guardar en la bandeja: inbox y push en paralelo, ninguno espera al otro ni toca la bandeja
           deliver: (created) => {
             void inbox.publish(created).then((failed) => {
               if (failed > 0) notificationLog.warn({ failed }, 'notifications: no se pudo avisar por el inbox de Chat');
+            });
+            void push.send(created).then((result) => {
+              if (result.failed > 0) notificationLog.warn(result, 'notifications: push con fallas');
             });
           },
         }));

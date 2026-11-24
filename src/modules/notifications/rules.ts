@@ -33,24 +33,42 @@ export function parseMessageCreated(
     authorId,
     threadParticipantIds: idList(payload.thread_participant_ids),
     mentionUserIds: idList(payload.mention_user_ids),
+    mentionRoleIds: idList(payload.mention_role_ids),
+    mentionEveryone: payload.mention_everyone === true,
+    recipientIds: idList(payload.recipient_ids),
     isDm: payload.is_dm === true,
     preview: typeof payload.preview === 'string' ? payload.preview.slice(0, PREVIEW_MAX) : '',
     createdAt: Number.isNaN(createdAt.getTime()) ? new Date() : createdAt,
   };
 }
 
+/** Lo que el evento no trae como lista y se busca aparte (ver processor). */
+export interface ExpandedRecipients {
+  /** Mencionados por `@everyone` (los miembros del servidor) o por un rol (sus miembros). */
+  mentionIds?: string[];
+  /** Quienes pidieron `all` en este canal o servidor (y siguen siendo miembros). */
+  allLevelIds?: string[];
+}
+
 /**
  * A quién le podría interesar el mensaje y por qué, sin mirar preferencias. Nunca al autor, y una sola vez
- * por usuario. Hoy: participantes de un hilo. La épica suma menciones y DMs acá.
+ * por usuario: si cae en varios casos gana mention > dm > thread_reply > message.
  */
-export function candidates(event: MessageCreatedEvent): Candidate[] {
-  if (!event.threadId) return [];
+export function candidates(event: MessageCreatedEvent, expanded: ExpandedRecipients = {}): Candidate[] {
+  const byReason: [Reason, string[]][] = [
+    ['mention', [...event.mentionUserIds, ...(expanded.mentionIds ?? [])]],
+    ['dm', event.isDm ? event.recipientIds : []],
+    ['thread_reply', event.threadId ? event.threadParticipantIds : []],
+    ['message', expanded.allLevelIds ?? []],
+  ];
   const seen = new Set<string>([event.authorId]);
   const result: Candidate[] = [];
-  for (const userId of event.threadParticipantIds) {
-    if (seen.has(userId)) continue;
-    seen.add(userId);
-    result.push({ userId, reason: 'thread_reply' });
+  for (const [reason, userIds] of byReason) {
+    for (const userId of userIds) {
+      if (seen.has(userId)) continue;
+      seen.add(userId);
+      result.push({ userId, reason });
+    }
   }
   return result;
 }
@@ -92,7 +110,10 @@ export function resolve(prefs: Preference[], scope: Scope, now: Date = new Date(
   return { level, muted: chain.some((p) => isMutedNow(p, now)) };
 }
 
-/** Si corresponde avisar. `mentions` deja pasar lo que te involucra: menciones, DMs y tus hilos. */
+/**
+ * Si corresponde avisar. `mentions` deja pasar lo que te involucra: menciones, DMs y tus hilos. Un mensaje
+ * cualquiera (`message`) solo pasa con `all`.
+ */
 export function shouldNotify(resolved: ResolvedPreference, reason: Reason): boolean {
   if (resolved.muted || resolved.level === 'none') return false;
   if (resolved.level === 'all') return true;
