@@ -101,4 +101,42 @@ export const MIGRATIONS: readonly Migration[] = [
         WHERE server_id IS NOT NULL;
     `,
   },
+  {
+    // reason `message`: el nivel `all` (un mensaje cualquiera del canal o servidor). Solo amplía el CHECK: la
+    // imagen anterior sigue arrancando y lee estas filas igual.
+    id: '003_notification_reason_message',
+    sql: `
+      ALTER TABLE notifications DROP CONSTRAINT notifications_reason_check;
+      ALTER TABLE notifications ADD CONSTRAINT notifications_reason_check
+        CHECK (reason IN ('thread_reply', 'mention', 'dm', 'message'));
+    `,
+  },
+  {
+    // Push (ADR-08): dispositivos y el interruptor general por usuario. Tablas nuevas: la imagen anterior las
+    // ignora.
+    id: '004_push',
+    sql: `
+      CREATE TABLE push_devices (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id text NOT NULL,
+        platform text NOT NULL CHECK (platform IN ('ios', 'android', 'web')),
+        -- Expo push token en mobile; el endpoint de la suscripción en web. Un dispositivo es de un solo usuario
+        token text NOT NULL UNIQUE,
+        -- p256dh y auth de la suscripción web (null en mobile)
+        keys jsonb,
+        created_at timestamptz(3) NOT NULL DEFAULT now(),
+        last_seen_at timestamptz(3) NOT NULL DEFAULT now(),
+        CHECK ((platform = 'web') = (keys IS NOT NULL))
+      );
+
+      CREATE INDEX push_devices_user_idx ON push_devices (user_id, last_seen_at DESC);
+
+      -- Sin fila = push_enabled true (el default no pide escribir nada por usuario)
+      CREATE TABLE push_settings (
+        user_id text PRIMARY KEY,
+        push_enabled boolean NOT NULL DEFAULT true,
+        updated_at timestamptz(3) NOT NULL DEFAULT now()
+      );
+    `,
+  },
 ];

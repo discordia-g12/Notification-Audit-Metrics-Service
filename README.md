@@ -60,11 +60,13 @@ publica el 3001 y usa la base `notification_db` del Postgres compartido (en prod
 | `STATUS_PROBE_TIMEOUT_MS` | `2000` | Timeout de cada sonda (100 a 60000, menor que el intervalo) |
 | `RABBITMQ_URL` | `amqp://admin:admin@rabbitmq:5672/` | Conexión al broker RabbitMQ para consumir eventos de auditoría |
 | `RABBITMQ_QUEUE` | `notification_audit_events.v2` | Cola de auditoría, con DLQ `<cola>.dlq` y prefetch 10. No usar `notification_audit_events` (la anterior, sin DLQ): RabbitMQ rechaza declararla con otros argumentos. El consumidor la retira solo (ADR-04) |
-| `SERVER_ROLES_URL` | `http://localhost:8000` | URL interna de Server-Roles-Core para validación de permisos de moderador |
+| `SERVER_ROLES_URL` | `http://localhost:8000` | URL interna de Server-Roles-Core: permisos de moderador, miembros del servidor (`@everyone` y nivel `all` de notificaciones) y quiénes ven un canal (filtro de avisos de canales privados) |
 | `CHAT_ENGINE_URL` | `http://localhost:3000` | Base de Chat-Engine para las métricas (`/internal/metrics/messages`). En prod, mismo nodo realtime |
 | `CORE_SERVICE_URL` | `http://localhost:8002` | Base de Server-Roles-Core para las métricas (`/internal/metrics/servers`). En prod, `http://<EDGE_HOST>:8002` |
 | `RABBITMQ_MESSAGE_QUEUE` | `notification_message_events` | Cola de `chat.message.created`, `channel.deleted` y `server.deleted` (aparte de la de auditoría). Lo que falla va a `<cola>.dlq` |
 | `INTERNAL_API_TOKEN` | (sin definir) | Secreto compartido con Chat para avisar en vivo por `/internal/inbox/events` (header `X-Internal-Token`). Tiene que ser el mismo que el de Chat |
+| `EXPO_ACCESS_TOKEN` | (sin definir) | Push a mobile por la Expo Push API. Solo hace falta si el proyecto de Expo tiene activado push seguro ([ADR-08](docs/ADR-08-Push.md)) |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | (sin definir) | Push web (`npx web-push generate-vapid-keys`; subject `mailto:…`). Si falta alguna, push web queda apagado |
 
 Un valor inválido en las `STATUS_*`, `CHAT_ENGINE_URL` o `CORE_SERVICE_URL` corta el arranque.
 
@@ -88,6 +90,9 @@ Un valor inválido en las `STATUS_*`, `CHAT_ENGINE_URL` o `CORE_SERVICE_URL` cor
 | `GET` | `/api/v1/notifications/preferences` | Preferencias del usuario: `{ items }` |
 | `PUT` | `/api/v1/notifications/preferences/{server\|channel\|thread}/{scopeId}` | Crea o cambia una preferencia (`{ level?, muted?, mutedUntil?, serverId? }`); solo cambia lo que llega |
 | `DELETE` | `/api/v1/notifications/preferences/{server\|channel\|thread}/{scopeId}` | Vuelve al default: `204` |
+| `POST`/`DELETE` | `/api/v1/notifications/push/devices` | Registra (`{ platform, token }` o `{ platform: "web", subscription }`) o borra (`{ token }`) un dispositivo propio: `204` ([ADR-08](docs/ADR-08-Push.md)) |
+| `GET`/`PUT` | `/api/v1/notifications/push/settings` | `{ pushEnabled }` (default `true`) |
+| `GET` | `/api/v1/notifications/push/vapid-public-key` | `{ publicKey }` para suscribirse en la web (`null` sin VAPID) |
 
 El contrato completo está en [`docs/openapi.yaml`](docs/openapi.yaml).
 
@@ -187,6 +192,8 @@ Bandeja y preferencias del usuario (historia "Responder en un hilo", CA5). Todas
 - **Entrega:** se guarda en `notifications` (la fuente de verdad) y se avisa en vivo con `NOTIFICATION_CREATED`
   por el inbox de Chat (`/internal/inbox/events`, lotes de 10, sin reintento). Si Chat no responde, el aviso
   igual queda en la bandeja.
+- **Push:** a la vez que el inbox, a los dispositivos de quien no apagó `pushEnabled`: Expo para mobile, Web
+  Push para la web. Un intento; los tokens que el proveedor da por muertos se borran ([ADR-08](docs/ADR-08-Push.md)).
 - **Retención:** al arrancar y cada 6 h se borran las leídas de más de 30 días y todas las de más de 90.
   `channel.deleted` y `server.deleted` borran avisos y preferencias de ese canal o servidor.
 
@@ -229,7 +236,7 @@ src/
 │   ├── incidents/ store en Postgres (con auditoría), caché de activos, vistas y rutas de staff
 │   ├── audit/     almacenamiento en Postgres, consumidor RabbitMQ, permisos y endpoint de auditoría de servidores
 │   ├── metrics/   métricas globales: período, consulta a Chat y Server-Roles, caché de 60 s y ruta de staff
-│   └── notifications/ reglas de preferencia (puras), consumer con DLQ, bandeja en Postgres, aviso por el inbox de Chat y rutas
+│   └── notifications/ reglas de preferencia (puras), consumer con DLQ, bandeja en Postgres, aviso por el inbox de Chat, push y rutas
 ├── utils/        db-check.ts (SELECT 1 con timeout) y problem.ts (respuestas application/problem+json)
 ├── plugins/      (vacío)
 tests/
@@ -256,3 +263,4 @@ tests/
 | [ADR-05](docs/ADR-05-Metricas-globales.md) | Métricas globales del backoffice por consulta síncrona a Chat y Server-Roles |
 | [ADR-06](docs/ADR-06-Exportacion-de-metricas-a-CSV.md) | Exportación de métricas a CSV |
 | [ADR-07](docs/ADR-07-Notificaciones-y-preferencias.md) | Bandeja y preferencias de notificación, consumo de `chat.message.created` |
+| [ADR-08](docs/ADR-08-Push.md) | Notificaciones push: Expo para mobile, Web Push (VAPID) para la web |

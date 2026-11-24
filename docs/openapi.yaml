@@ -354,6 +354,84 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /api/v1/notifications/push/devices:
+    post:
+      summary: Registra (o refresca) un dispositivo para push (ADR-08)
+      description: >-
+        Mobile manda el Expo push token; web, la suscripción del navegador (`PushSubscription.toJSON()`). Si el
+        token ya estaba registrado por otro usuario, pasa a este. Hasta 10 dispositivos por usuario: el que hace
+        más que no se registra se borra. Conviene llamarlo en cada inicio de la app.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushDeviceRegistration' }
+      responses:
+        '204': { description: Registrado }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      summary: Borra un dispositivo propio (al cerrar sesión o al desactivar push en el dispositivo)
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, maxLength: 1024, description: 'Expo push token, o el `endpoint` de la suscripción web' }
+      responses:
+        '204': { description: Listo, existiera o no (el de otro usuario no se toca) }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/push/settings:
+    get:
+      summary: Si el usuario recibe push (default `true`)
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: El interruptor general
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      summary: Prende o apaga push para todos los dispositivos del usuario. No cambia la bandeja ni los contadores.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushSettings' }
+      responses:
+        '200':
+          description: Como quedó
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/push/vapid-public-key:
+    get:
+      summary: Clave pública VAPID para `pushManager.subscribe` en la web
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: '`null` si el entorno no tiene push web configurado'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [publicKey]
+                properties:
+                  publicKey: { type: [string, 'null'], description: base64url }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
 components:
   securitySchemes:
     bearer: { type: http, scheme: bearer, bearerFormat: JWT }
@@ -537,10 +615,15 @@ components:
         hasMore: { type: boolean }
     NotificationReason:
       type: string
-      description: Hoy solo se genera `thread_reply`.
-      enum: [thread_reply, mention, dm]
+      description: >-
+        `mention` (te nombraron, o `@everyone`), `dm` (mensaje directo), `thread_reply` (respuesta en un hilo
+        donde participás) o `message` (un mensaje cualquiera de un canal o servidor donde pediste `all`). Uno
+        por usuario y mensaje: si caés en varios, gana el primero de esa lista.
+      enum: [mention, dm, thread_reply, message]
     NotificationLevel:
       type: string
+      description: >-
+        `all`: todos los mensajes; `mentions`: lo que te involucra (menciones, DMs y tus hilos); `none`: nada.
       enum: [all, mentions, none]
     NotificationScopeType:
       type: string
@@ -577,3 +660,52 @@ components:
         muted: { type: boolean }
         mutedUntil: { type: [string, 'null'], format: date-time }
         updatedAt: { type: string, format: date-time }
+    PushDeviceRegistration:
+      type: object
+      required: [platform]
+      description: '`ios` y `android` llevan `token`; `web` lleva `subscription`.'
+      properties:
+        platform: { type: string, enum: [ios, android, web] }
+        token: { type: string, maxLength: 255, pattern: '^Expo(nent)?PushToken\[[A-Za-z0-9_-]{1,200}\]$' }
+        subscription:
+          type: object
+          required: [endpoint, keys]
+          properties:
+            endpoint:
+              type: string
+              format: uri
+              maxLength: 1024
+              description: >-
+                Solo `https` de los servicios de push de los navegadores (`fcm.googleapis.com`,
+                `push.services.mozilla.com`, `notify.windows.com`, `push.apple.com` y sus subdominios).
+            keys:
+              type: object
+              required: [p256dh, auth]
+              properties:
+                p256dh: { type: string, description: base64url }
+                auth: { type: string, description: base64url }
+    PushSettings:
+      type: object
+      required: [pushEnabled]
+      properties:
+        pushEnabled: { type: boolean }
+    PushPayload:
+      description: >-
+        Lo que llega al dispositivo (no es una respuesta de la API). En mobile, `title`/`body`/`data` del mensaje de
+        Expo; en web, este JSON como payload del evento `push` del service worker. `data` usa los mismos nombres
+        que `Notification`. El backend manda siempre: el cliente lo oculta si la app está en primer plano.
+      type: object
+      required: [title, body, data]
+      properties:
+        title: { type: string, description: 'Según `reason`: "Te mencionaron", "Mensaje directo", "Respuesta en un hilo" o "Mensaje nuevo"' }
+        body: { type: string, maxLength: 140, description: El preview de la bandeja }
+        data:
+          type: object
+          required: [notificationId, reason, serverId, channelId, threadId, messageId]
+          properties:
+            notificationId: { type: string, format: uuid }
+            reason: { $ref: '#/components/schemas/NotificationReason' }
+            serverId: { type: [string, 'null'] }
+            channelId: { type: string }
+            threadId: { type: [string, 'null'] }
+            messageId: { type: string }

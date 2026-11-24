@@ -48,6 +48,8 @@ test('runMigrations: aplica las del servicio una sola vez', async () => {
     'incidents',
     'notification_preferences',
     'notifications',
+    'push_devices',
+    'push_settings',
     'schema_migrations',
   ]);
   assert.strictEqual(logger.lines.filter((l) => l.msg === 'migración aplicada').length, MIGRATIONS.length);

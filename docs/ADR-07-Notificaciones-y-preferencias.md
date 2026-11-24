@@ -30,8 +30,26 @@ Restricciones:
   `prefetch(10)` y **DLQ** (`<cola>.dlq` por el exchange por defecto): un evento inválido o un error de base
   va ahí con `nack` sin reencolar, para revisarlo sin entrar en loop.
 * **Tres pasos separados**, para que la épica sume casos sin reescribir:
-  1. `candidates(event)`: quién podría querer enterarse y por qué (`reason`). Hoy, los participantes del hilo
-     menos el autor (`thread_reply`). Menciones y DMs se suman acá.
+  1. `candidates(event)`: quién podría querer enterarse y por qué (`reason`), nunca el autor y uno por
+     usuario. Si cae en varios, gana `mention` > `dm` > `thread_reply` > `message`:
+     * `mention`: `mention_user_ids`; con `mention_everyone`, los miembros del servidor; y los miembros de
+       cada rol de `mention_role_ids`.
+     * `dm`: `recipient_ids` (participantes del DM menos el autor), solo si `is_dm`. Opcional: los eventos
+       viejos no lo traen.
+     * `thread_reply`: los participantes del hilo.
+     * `message`: quienes pidieron `all` en el canal o en el servidor. Se buscan con el índice parcial
+       `notification_preferences_all_idx` (`WHERE level = 'all'`), sin recorrer miembros.
+
+     Lo que no viaja como lista se le pide a Server-Roles (timeout 2 s), solo si hace falta:
+     * `GET /internal/servers/{id}/member-ids`, una vez, con `@everyone` o si alguien tiene `all`. Los de `all`
+       se cruzan con los miembros: una preferencia `all` de alguien que se fue del servidor no le sigue
+       mostrando los mensajes.
+     * `GET /internal/servers/{id}/roles/{roleId}/member-ids`, una por rol mencionado, en paralelo. No se pide
+       con `@everyone` (ya los incluye). Si ya se pidieron los miembros del servidor, se cruzan con ellos.
+
+     Si Server-Roles no responde, el evento va a la DLQ (no se pierde; al reencolarlo,
+     `UNIQUE (event_id, user_id)` no duplica). Un 404 (servidor borrado, o rol de otro servidor) no avisa a
+     nadie.
   2. `resolve(prefs, scope)` + `shouldNotify(resolved, reason)`: funciones puras. Las preferencias de todos
      los candidatos se leen en una sola consulta.
   3. Entrega: un `INSERT … SELECT unnest(…) ON CONFLICT DO NOTHING RETURNING` y, a los insertados, el aviso en
@@ -43,7 +61,8 @@ Restricciones:
   * `level` nulo hereda. Se aplica la más específica: hilo → canal → servidor → default (`mentions` en un
     servidor, `all` en un DM). Un silencio vigente en cualquier nivel silencia lo de abajo.
   * `mentions` deja pasar lo que te involucra: una mención, un DM o una respuesta en un hilo donde
-    participás. `none` y `muted` no dejan pasar nada.
+    participás. `message` solo pasa con `all`. `none` y `muted` no dejan pasar nada. Por eso un canal en
+    `mentions` pisa un servidor en `all`.
   * `PUT` cambia solo los campos que llegan; `DELETE` vuelve al default. `server_id` se guarda para poder
     limpiar al borrar el servidor.
 * **Bandeja:** `notifications` con `reason`, `server_id` (null en DM), `channel_id`, `thread_id`, `actor_id`,
@@ -77,8 +96,20 @@ Restricciones:
 * Si el aviso en vivo falla, el usuario lo ve al refrescar la bandeja (la web la consulta cada 60 s y al
   volver el foco).
 * La DLQ no se vacía sola: hay que revisarla desde el panel de RabbitMQ (`localhost:15672`) y reencolar a mano.
-* Escala con la épica: `level = 'all'` tiene un índice parcial para buscar quién lo pidió sin recorrer
-  miembros, y `reason` ya acepta `mention` y `dm`. Push sería un paso más en la entrega, con tokens de
-  dispositivo y `push_enabled` por usuario.
+* Chat publica `chat.message.created` para todo mensaje de canal y de DM, así que el consumidor recibe cada
+  mensaje. El caso común (mensaje de canal sin menciones, sin hilo, nadie con `all`) cuesta **una consulta**
+  sobre el índice parcial de `all` y ninguna llamada a Server-Roles. Un DM no busca `all` (el destinatario ya
+  es candidato): lee preferencias e inserta. Server-Roles se llama para expandir `@everyone`, roles o `all`, y para filtrar
+  por visibilidad cuando un mensaje de servidor tiene algún candidato.
+* `reason` suma `message` (migración `003`, que solo amplía el `CHECK`). Los clientes que no lo conozcan lo
+  tienen que mostrar como un mensaje nuevo del canal.
+* Push es un paso más en la entrega, enganchado en `deliver` (después del `INSERT`, solo con los avisos
+  nuevos), al lado del inbox: ver [ADR-08](ADR-08-Push.md).
+* Visibilidad del canal: en un canal privado no todos los miembros lo ven, y el aviso lleva el `preview` del
+  mensaje. Por eso, en mensajes de servidor, después de armar los candidatos (menciones directas, `@everyone`,
+  roles, `all` y participantes de hilo) se filtran con `POST /internal/channels/{id}/viewers` de Server-Roles:
+  una llamada por evento (lotes de 5000). Los DMs no pasan por el filtro. Si Server-Roles no responde, el
+  evento va a la DLQ: nunca se avisa sin filtrar. Canal borrado (404) → nadie recibe el aviso. Ahora un mensaje
+  de servidor con algún candidato siempre llama a Server-Roles.
 * Las preferencias de hilos de un canal borrado no se limpian con `channel.deleted` (no se guarda el canal de
   cada hilo); quedan hasta que se borra el servidor. Son filas chicas y sin efecto.

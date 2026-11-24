@@ -17,6 +17,11 @@ export interface NotificationConsumerOptions {
   queue?: string;
   pool: Pool;
   deliver: (notifications: Notification[]) => void;
+  /** Miembros de un servidor, para `@everyone` y el nivel `all` (ver processor). */
+  memberIds: (serverId: string) => Promise<string[]>;
+  roleMemberIds: (serverId: string, roleId: string) => Promise<string[]>;
+  /** Quiénes de una lista ven el canal, para no avisar de canales privados. */
+  channelViewerIds: (channelId: string, userIds: string[]) => Promise<string[]>;
   logger?: NotificationConsumerLogger;
   /** Para tests: reemplaza amqplib.connect. */
   connect?: (url: string) => Promise<ChannelModel>;
@@ -51,6 +56,9 @@ export class NotificationConsumer {
   private readonly queue: string;
   private readonly pool: Pool;
   private readonly deliver: (notifications: Notification[]) => void;
+  private readonly memberIds: (serverId: string) => Promise<string[]>;
+  private readonly roleMemberIds: (serverId: string, roleId: string) => Promise<string[]>;
+  private readonly channelViewerIds: (channelId: string, userIds: string[]) => Promise<string[]>;
   private readonly logger: NotificationConsumerLogger;
   private readonly connectFn?: (url: string) => Promise<ChannelModel>;
   private readonly baseDelayMs: number;
@@ -62,6 +70,9 @@ export class NotificationConsumer {
     this.queue = options.queue || process.env.RABBITMQ_MESSAGE_QUEUE || 'notification_message_events';
     this.pool = options.pool;
     this.deliver = options.deliver;
+    this.memberIds = options.memberIds;
+    this.roleMemberIds = options.roleMemberIds;
+    this.channelViewerIds = options.channelViewerIds;
     this.logger = options.logger || console;
     this.connectFn = options.connect;
     this.baseDelayMs = options.baseDelayMs ?? RECONNECT_BASE_MS;
@@ -157,7 +168,10 @@ export class NotificationConsumer {
     }
   }
 
-  /** ack si se procesó (o ya se había procesado); nack sin reencolar → DLQ si el evento es inválido o falla. */
+  /**
+   * ack si se procesó (o ya se había procesado); nack sin reencolar → DLQ si el evento es inválido o falla
+   * (base o Server-Roles caídos). Reencolarlo desde la DLQ es seguro: `(event_id, user_id)` no duplica.
+   */
   async handleMessage(msg: ConsumeMessage, channel: Channel): Promise<void> {
     const routingKey = msg.fields.routingKey;
     try {
@@ -167,7 +181,16 @@ export class NotificationConsumer {
       if (routingKey === 'chat.message.created') {
         const event = parseMessageCreated(payload, msg.properties.messageId);
         if (!event) throw new Error('invalid chat.message.created payload');
-        const created = await processMessageCreated({ pool: this.pool, deliver: this.deliver }, event);
+        const created = await processMessageCreated(
+          {
+            pool: this.pool,
+            deliver: this.deliver,
+            memberIds: this.memberIds,
+            roleMemberIds: this.roleMemberIds,
+            channelViewerIds: this.channelViewerIds,
+          },
+          event,
+        );
         if (created.length > 0) {
           this.logger.info({ eventId: event.eventId, notifications: created.length }, 'notifications created');
         }

@@ -83,6 +83,21 @@ export async function findPreferencesFor(pool: Pool, userIds: string[], scope: S
 }
 
 /**
+ * Quiénes pidieron `all` en este canal o en su servidor. Usa el índice parcial `notification_preferences_all_idx`
+ * (solo las filas con `all`): en el caso común no encuentra nada y es la única consulta del evento. No mira
+ * si un nivel más específico lo pisa: eso lo resuelve `resolve` con el resto de sus preferencias.
+ */
+export async function findAllLevelUserIds(pool: Pool, serverId: string, channelId: string): Promise<string[]> {
+  const { rows } = await pool.query<{ user_id: string }>(
+    `SELECT DISTINCT user_id FROM notification_preferences
+      WHERE level = 'all'
+        AND ((scope_type = 'channel' AND scope_id = $1) OR (scope_type = 'server' AND scope_id = $2))`,
+    [channelId, serverId],
+  );
+  return rows.map((r) => r.user_id);
+}
+
+/**
  * Guarda los avisos en un solo INSERT. Los que ya existían (misma entrega repetida) no vuelven: el que
  * llama solo reparte los nuevos.
  */
