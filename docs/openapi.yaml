@@ -4,7 +4,8 @@ info:
   version: 1.0.0
   description: |
     Estado de la plataforma (ADR-02), incidentes (ADR-03), registro de auditoría de moderación de servidores (ADR-04)
-    y métricas globales para el backoffice (ADR-05).
+    y métricas globales para el backoffice (ADR-05). Bandeja y preferencias de notificación del usuario (ADR-07):
+    `/api/v1/notifications` exige `X-User-Id` (lo pone Kong) y cada usuario solo ve y cambia lo suyo.
     Las rutas `/api/v1/admin/*` pasan por Kong con `validate("staff")`; el servicio vuelve a chequear `X-User-Role`
     (y `X-User-Id` para escribir). Las rutas de auditoría de servidor `/api/v1/servers/{serverId}/audit-logs`
     verifican membresía y permisos de moderador contra Server-Roles. Errores en `application/problem+json`.
@@ -160,6 +161,54 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/servers/{serverId}/metrics:
+    get:
+      summary: Métricas de actividad de un servidor, en JSON o CSV (ADR-06)
+      description: |
+        Solo el dueño o miembros con `ADMINISTRATOR` o `MANAGE_SERVER`. Período por `days` o por `from`/`to`.
+        Con `format=csv` devuelve la serie diaria como archivo descargable; si alguna fuente no respondió, `503`
+        en lugar de un archivo incompleto.
+      security: [{ bearer: [] }]
+      parameters:
+        - name: serverId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: days
+          in: query
+          description: Últimos N días hasta ahora. Se ignora si vienen `from` o `to`.
+          schema: { type: integer, minimum: 1, maximum: 366 }
+        - name: from
+          in: query
+          description: Inicio del período (incluido), ISO 8601.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Fin del período (excluido), ISO 8601. Hasta 366 días después de `from`.
+          schema: { type: string, format: date-time }
+        - name: format
+          in: query
+          schema: { type: string, enum: [json, csv], default: json }
+      responses:
+        '200':
+          description: |
+            JSON con totales y serie diaria, o CSV con encabezado
+            `fecha,miembros_activos,mensajes_enviados,nuevos_miembros` y una fila por día (CRLF).
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+            Content-Disposition:
+              description: Solo con `format=csv`.
+              schema: { type: string, example: 'attachment; filename="metricas-servidor-<id>-2026-11-10_2026-11-12.csv"' }
+          content:
+            application/json:
+              schema: { type: object }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
   /api/v1/servers/{serverId}/audit-logs:
     get:
       summary: Registro de auditoría de moderación de un servidor (HU 61, ADR-04)
@@ -205,6 +254,183 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
+
+  /api/v1/notifications:
+    get:
+      summary: Bandeja del usuario, de la más nueva a la más vieja (ADR-07)
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: unread, in: query, required: false, schema: { type: boolean, default: false } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - name: before
+          in: query
+          required: false
+          description: '`nextCursor` de la página anterior'
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Página de la bandeja. `unreadCount` tiene tope 100.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/{id}/read:
+    post:
+      summary: Marca una notificación propia como leída
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Leída (marcarla otra vez no cambia la hora) }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /api/v1/notifications/read-all:
+    post:
+      summary: Marca leídas todas las notificaciones propias
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Listo }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/preferences:
+    get:
+      summary: Preferencias de notificación del usuario
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: Hasta 500 preferencias
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/NotificationPreference' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/preferences/{scopeType}/{scopeId}:
+    parameters:
+      - { name: scopeType, in: path, required: true, schema: { $ref: '#/components/schemas/NotificationScopeType' } }
+      - name: scopeId
+        in: path
+        required: true
+        description: Id del servidor, del canal (o `dm-…`) o del mensaje raíz del hilo
+        schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }
+    put:
+      summary: Crea o cambia una preferencia. Solo cambia los campos que llegan.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              description: Tiene que traer al menos `level`, `muted` o `mutedUntil`.
+              properties:
+                level: { oneOf: [{ $ref: '#/components/schemas/NotificationLevel' }, { type: 'null' }] }
+                muted: { type: boolean }
+                mutedUntil: { type: [string, 'null'], format: date-time }
+                serverId: { type: string, description: 'Servidor del canal o del hilo, para limpiar al borrarlo' }
+      responses:
+        '200':
+          description: La preferencia como quedó
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreference' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      summary: Vuelve al default (borra la preferencia)
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Listo, existiera o no }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/push/devices:
+    post:
+      summary: Registra (o refresca) un dispositivo para push (ADR-08)
+      description: >-
+        Mobile manda el Expo push token; web, la suscripción del navegador (`PushSubscription.toJSON()`). Si el
+        token ya estaba registrado por otro usuario, pasa a este. Hasta 10 dispositivos por usuario: el que hace
+        más que no se registra se borra. Conviene llamarlo en cada inicio de la app.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushDeviceRegistration' }
+      responses:
+        '204': { description: Registrado }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      summary: Borra un dispositivo propio (al cerrar sesión o al desactivar push en el dispositivo)
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, maxLength: 1024, description: 'Expo push token, o el `endpoint` de la suscripción web' }
+      responses:
+        '204': { description: Listo, existiera o no (el de otro usuario no se toca) }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/push/settings:
+    get:
+      summary: Si el usuario recibe push (default `true`)
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: El interruptor general
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      summary: Prende o apaga push para todos los dispositivos del usuario. No cambia la bandeja ni los contadores.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushSettings' }
+      responses:
+        '200':
+          description: Como quedó
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/push/vapid-public-key:
+    get:
+      summary: Clave pública VAPID para `pushManager.subscribe` en la web
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: '`null` si el entorno no tiene push web configurado'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [publicKey]
+                properties:
+                  publicKey: { type: [string, 'null'], description: base64url }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
 components:
   securitySchemes:
@@ -387,3 +613,99 @@ components:
           items: { $ref: '#/components/schemas/AuditLogEntry' }
         nextBefore: { type: [string, 'null'], format: date-time }
         hasMore: { type: boolean }
+    NotificationReason:
+      type: string
+      description: >-
+        `mention` (te nombraron, o `@everyone`), `dm` (mensaje directo), `thread_reply` (respuesta en un hilo
+        donde participás) o `message` (un mensaje cualquiera de un canal o servidor donde pediste `all`). Uno
+        por usuario y mensaje: si caés en varios, gana el primero de esa lista.
+      enum: [mention, dm, thread_reply, message]
+    NotificationLevel:
+      type: string
+      description: >-
+        `all`: todos los mensajes; `mentions`: lo que te involucra (menciones, DMs y tus hilos); `none`: nada.
+      enum: [all, mentions, none]
+    NotificationScopeType:
+      type: string
+      enum: [server, channel, thread]
+    Notification:
+      type: object
+      required: [id, reason, serverId, channelId, threadId, messageId, actorId, preview, createdAt, readAt]
+      properties:
+        id: { type: string, format: uuid }
+        reason: { $ref: '#/components/schemas/NotificationReason' }
+        serverId: { type: [string, 'null'], description: '`null` en un DM' }
+        channelId: { type: string }
+        threadId: { type: [string, 'null'], description: Id del mensaje raíz del hilo }
+        messageId: { type: string }
+        actorId: { type: string, description: Quién escribió }
+        preview: { type: string, maxLength: 140 }
+        createdAt: { type: string, format: date-time }
+        readAt: { type: [string, 'null'], format: date-time }
+    NotificationPage:
+      type: object
+      required: [items, unreadCount, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+        unreadCount: { type: integer, minimum: 0, maximum: 100 }
+        nextCursor: { type: [string, 'null'], format: uuid }
+    NotificationPreference:
+      type: object
+      required: [scopeType, scopeId, serverId, level, muted, mutedUntil, updatedAt]
+      properties:
+        scopeType: { $ref: '#/components/schemas/NotificationScopeType' }
+        scopeId: { type: string }
+        serverId: { type: [string, 'null'] }
+        level: { oneOf: [{ $ref: '#/components/schemas/NotificationLevel' }, { type: 'null' }], description: '`null` hereda' }
+        muted: { type: boolean }
+        mutedUntil: { type: [string, 'null'], format: date-time }
+        updatedAt: { type: string, format: date-time }
+    PushDeviceRegistration:
+      type: object
+      required: [platform]
+      description: '`ios` y `android` llevan `token`; `web` lleva `subscription`.'
+      properties:
+        platform: { type: string, enum: [ios, android, web] }
+        token: { type: string, maxLength: 255, pattern: '^Expo(nent)?PushToken\[[A-Za-z0-9_-]{1,200}\]$' }
+        subscription:
+          type: object
+          required: [endpoint, keys]
+          properties:
+            endpoint:
+              type: string
+              format: uri
+              maxLength: 1024
+              description: >-
+                Solo `https` de los servicios de push de los navegadores (`fcm.googleapis.com`,
+                `push.services.mozilla.com`, `notify.windows.com`, `push.apple.com` y sus subdominios).
+            keys:
+              type: object
+              required: [p256dh, auth]
+              properties:
+                p256dh: { type: string, description: base64url }
+                auth: { type: string, description: base64url }
+    PushSettings:
+      type: object
+      required: [pushEnabled]
+      properties:
+        pushEnabled: { type: boolean }
+    PushPayload:
+      description: >-
+        Lo que llega al dispositivo (no es una respuesta de la API). En mobile, `title`/`body`/`data` del mensaje de
+        Expo; en web, este JSON como payload del evento `push` del service worker. `data` usa los mismos nombres
+        que `Notification`. El backend manda siempre: el cliente lo oculta si la app está en primer plano.
+      type: object
+      required: [title, body, data]
+      properties:
+        title: { type: string, description: 'Según `reason`: "Te mencionaron", "Mensaje directo", "Respuesta en un hilo" o "Mensaje nuevo"' }
+        body: { type: string, maxLength: 140, description: El preview de la bandeja }
+        data:
+          type: object
+          required: [notificationId, reason, serverId, channelId, threadId, messageId]
+          properties:
+            notificationId: { type: string, format: uuid }
+            reason: { $ref: '#/components/schemas/NotificationReason' }
+            serverId: { type: [string, 'null'] }
+            channelId: { type: string }
+            threadId: { type: [string, 'null'] }
+            messageId: { type: string }

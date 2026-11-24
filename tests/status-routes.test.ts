@@ -10,7 +10,10 @@ const UNREACHABLE_DB = 'postgresql://postgres:password@127.0.0.1:1/notification_
 
 async function appWith(results: Map<string, ProbeResult | Error>) {
   const { monitor } = fakeMonitor(results);
-  const app = buildApp({ databaseUrl: UNREACHABLE_DB, env: {}, statusMonitor: monitor, logger: false });
+  // Sin start() en el ready: la única ronda es el poll() de abajo, así checkedAt y since no dependen de
+  // cuándo resuelve ready() respecto de la primera ronda (en Fastify 5 resuelve unos ticks más tarde).
+  const manual = { start: () => {}, stop: () => monitor.stop(), snapshot: () => monitor.snapshot() };
+  const app = buildApp({ databaseUrl: UNREACHABLE_DB, env: {}, statusMonitor: manual, logger: false });
   await app.ready();
   await monitor.poll();
   return app;

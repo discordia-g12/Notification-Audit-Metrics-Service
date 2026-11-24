@@ -1,0 +1,65 @@
+/**
+ * Por qué se le avisa a alguien. Si cae en varios, gana el primero de esta lista (uno por usuario).
+ * `message`: un mensaje cualquiera de un canal o servidor donde pidió el nivel `all`.
+ */
+export const REASONS = ['mention', 'dm', 'thread_reply', 'message'] as const;
+export type Reason = (typeof REASONS)[number];
+
+export const LEVELS = ['all', 'mentions', 'none'] as const;
+export type Level = (typeof LEVELS)[number];
+
+export const SCOPE_TYPES = ['server', 'channel', 'thread'] as const;
+export type ScopeType = (typeof SCOPE_TYPES)[number];
+
+/** `chat.message.created` de Chat-Engine (ADR-07 de Chat, ADR 0017), ya validado. */
+export interface MessageCreatedEvent {
+  eventId: string;
+  serverId: string | null;
+  channelId: string;
+  threadId: string | null;
+  messageId: string;
+  authorId: string;
+  threadParticipantIds: string[];
+  mentionUserIds: string[];
+  mentionRoleIds: string[];
+  mentionEveryone: boolean;
+  /** Participantes del DM menos el autor. Solo en DMs; los eventos viejos no lo traen. */
+  recipientIds: string[];
+  isDm: boolean;
+  preview: string;
+  createdAt: Date;
+}
+
+export interface Preference {
+  userId: string;
+  scopeType: ScopeType;
+  scopeId: string;
+  serverId: string | null;
+  level: Level | null;
+  muted: boolean;
+  mutedUntil: Date | null;
+  updatedAt: Date;
+}
+
+export interface Candidate {
+  userId: string;
+  reason: Reason;
+}
+
+export interface NewNotification {
+  userId: string;
+  reason: Reason;
+  serverId: string | null;
+  channelId: string;
+  threadId: string | null;
+  messageId: string;
+  actorId: string;
+  preview: string;
+  eventId: string;
+  createdAt: Date;
+}
+
+export interface Notification extends Omit<NewNotification, 'eventId'> {
+  id: string;
+  readAt: Date | null;
+}
